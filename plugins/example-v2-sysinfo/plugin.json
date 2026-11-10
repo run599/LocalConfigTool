@@ -1,0 +1,37 @@
+﻿{
+  "manifest": 2,
+  "engineApi": ">=1.0 <2.0",
+  "id": "example-v2-sysinfo",
+  "name": "示例插件（v2 清单参考实现）：系统状态只读快照",
+  "version": "1.0.0",
+  "description": "演示 v2 清单的完整形态：engineApi 门槛、capabilities 能力声明、kinds 入口声明、params 与 outputs 契约。只读：不修改任何系统设置、不写注册表、不启停任何服务。",
+  "risk": "medium",
+  "note": "复制这个目录改一个 id 就是你自己的插件骨架。capabilities 只申请 read.* 这类只读能力；写类能力（write.registry / write.process / account.change / service.control）会在界面上要求逐条确认。",
+  "capabilities": [
+    "read.registry",
+    "read.process"
+  ],
+  "kinds": [
+    "ps1"
+  ],
+  "entry": {
+    "kind": "ps1",
+    "path": "run.ps1"
+  },
+  "params": [
+    {
+      "name": "timeout",
+      "title": "超时（秒）",
+      "type": "int",
+      "required": false,
+      "default": 60,
+      "secret": false,
+      "help": "只读快照用不到，留作演示；run.ps1 不解析参数，任何形式的调用都不会出错。"
+    }
+  ],
+  "outputs": [
+    "stdout：单行 JSON，字段 os / build / ubr / arch / user / elevated / uacEnableLUA / autoAdminLogon / ciEnforcement / secureBoot / driverRunning / driverTotal",
+    "stderr：读取失败时的原因（通常为空）",
+    "exitCode：0=成功（即使个别字段读不到也为 0，缺失项以 null 表示）"
+  ]
+}

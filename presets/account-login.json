@@ -1,0 +1,92 @@
+﻿{
+  "id": "account-login",
+  "name": "账户与登录",
+  "description": "内置 Administrator 的启用/禁用、UAC 开关、自动登录开关，以及若干只读状态检查项。全部写类项默认只预览，需要 -Apply 才落盘；每项落盘前都会先创建备份。修改 UAC 需要重启生效；自动登录口令明文存盘，风险见该项说明。",
+  "risk": "high",
+  "items": [
+    {
+      "id": "uac-enable",
+      "title": "启用 UAC（用户账户控制）",
+      "summary": "写 EnableLUA=1、ConsentPromptBehaviorAdmin=5、PromptOnSecureDesktop=1、EnableInstallerDetection=1；需重启生效。",
+      "verb": "account.uac",
+      "args": { "enable": true }
+    },
+    {
+      "id": "uac-disable",
+      "title": "禁用 UAC（用户账户控制）",
+      "summary": "写 EnableLUA=0、ConsentPromptBehaviorAdmin=0、PromptOnSecureDesktop=0、EnableInstallerDetection=0；提权不再弹窗，显著降低防护，需重启生效。",
+      "verb": "account.uac",
+      "args": { "enable": false }
+    },
+    {
+      "id": "admin-enable",
+      "title": "启用内置 Administrator 账户",
+      "summary": "启用本机内置 Administrator。本工具不设口令（口令不接受命令行明文），启用后请立刻用「本地用户和组」或 net user 设置强口令。",
+      "verb": "account.admin",
+      "args": { "enable": true }
+    },
+    {
+      "id": "admin-disable",
+      "title": "禁用内置 Administrator 账户",
+      "summary": "禁用本机内置 Administrator（Windows 客户端的推荐默认状态）。",
+      "verb": "account.admin",
+      "args": { "enable": false }
+    },
+    {
+      "id": "autologon-enable",
+      "title": "启用自动登录",
+      "summary": "写 Winlogon 的 AutoAdminLogon=1 / DefaultUserName / DefaultDomainName / DefaultPassword。口令只从 passwordFile 读取，绝不接受命令行明文；使用前必须用 itemArgs 覆盖 user 与 passwordFile（passwordFile 也可给空文件表示空口令）。注意 AutoAdminLogon 的口令是明文存盘（任何本地管理员/离线挂载可读），更安全的替代是 Sysinternals Autologon（LSA secret）。",
+      "verb": "account.autologon",
+      "args": { "enable": true, "user": "", "passwordFile": "" }
+    },
+    {
+      "id": "autologon-disable",
+      "title": "禁用自动登录",
+      "summary": "写 AutoAdminLogon=0，并删除 DefaultPassword 以避免明文口令残留，同时清空 DefaultUserName / DefaultDomainName。",
+      "verb": "account.autologon",
+      "args": { "enable": false }
+    },
+    {
+      "id": "status-check",
+      "title": "查看账户 / UAC / 自动登录状态",
+      "summary": "只读：当前用户与其管理员组成员身份、本机全部本地账户、Administrators 组成员、UAC 四项实际值、自动登录开关与「是否已存口令」（永不返回口令内容）。",
+      "verb": "account.status",
+      "args": {}
+    },
+    {
+      "id": "check-uac-enablelua",
+      "title": "检查 UAC 总开关 EnableLUA",
+      "summary": "只读：读 UAC 总开关（1=启用，0=禁用）；值不存在时该 verb 返回 ok=false。",
+      "verb": "registry.get",
+      "args": { "path": "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "name": "EnableLUA" }
+    },
+    {
+      "id": "check-uac-consent",
+      "title": "检查提权提示行为 ConsentPromptBehaviorAdmin",
+      "summary": "只读：读管理员提权提示级别（0=不提示直接提权，2=需要凭据，5=默认的同意提示）。",
+      "verb": "registry.get",
+      "args": { "path": "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "name": "ConsentPromptBehaviorAdmin" }
+    },
+    {
+      "id": "check-uac-securedesktop",
+      "title": "检查 UAC 是否使用安全桌面",
+      "summary": "只读：读 PromptOnSecureDesktop（1=提示显示在安全桌面，0=不隔离）。",
+      "verb": "registry.get",
+      "args": { "path": "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "name": "PromptOnSecureDesktop" }
+    },
+    {
+      "id": "check-autologon-flag",
+      "title": "检查自动登录总开关 AutoAdminLogon",
+      "summary": "只读：读 Winlogon 的 AutoAdminLogon（1=启用，0=禁用）。",
+      "verb": "registry.get",
+      "args": { "path": "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "name": "AutoAdminLogon" }
+    },
+    {
+      "id": "check-autologon-state",
+      "title": "检查自动登录账号与口令是否已设置",
+      "summary": "只读：用 account.status 看自动登录的 enabled / user / hasPassword。刻意不用 registry.get 读 DefaultPassword——那会把明文口令带进输出，本工具任何结果里都不出现口令内容。",
+      "verb": "account.status",
+      "args": {}
+    }
+  ]
+}

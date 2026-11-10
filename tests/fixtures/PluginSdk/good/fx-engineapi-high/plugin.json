@@ -1,0 +1,11 @@
+﻿{
+  "manifest": 2,
+  "engineApi": ">=9.0 <9.5",
+  "id": "fx-engineapi-high",
+  "name": "Fixture：engineApi 门槛高于当前引擎",
+  "version": "1.0.0",
+  "description": "engineApi 不满足 ⇒ engineApiOk=false，但仍 ok=true（契约 §12.2 第 5 条：不得变成 ok=false），且不属于 v1 降级。",
+  "risk": "low",
+  "capabilities": [ "read.process" ],
+  "entry": { "kind": "exe", "path": "tool.exe" }
+}

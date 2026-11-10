@@ -1,0 +1,28 @@
+﻿{
+  "manifest": 2,
+  "engineApi": ">=1.0 <2.0",
+  "id": "fx-v2-full",
+  "name": "Fixture：合法 v2 完整清单",
+  "version": "2.0.0",
+  "description": "覆盖 v2 全字段：能力声明、入口种类、生命周期、完整性校验（sha256 与实际相符）、权限与兼容声明。",
+  "risk": "low",
+  "capabilities": [ "read.fs", "write.fs" ],
+  "kinds": [ "ps1" ],
+  "entry": { "kind": "ps1", "path": "run.ps1" },
+  "lifecycle": {
+    "preflight": "run.ps1 -Action preflight",
+    "install": "run.ps1 -Action install",
+    "uninstall": "run.ps1 -Action uninstall"
+  },
+  "verbs": [
+    { "name": "status", "summary": "查看夹具状态", "mutating": false, "args": [] }
+  ],
+  "settings": [],
+  "permissions": { "requireElevated": false, "requireApply": true, "confirmText": "" },
+  "integrity": {
+    "sha256": {
+      "payload\\blob.txt": "fe8bc028915164c1cd904c237dfff6d527643b7260c39bea97af1c1c326d0381"
+    }
+  },
+  "compat": { "osBuild": ">=19041", "arch": [ "x64" ], "notes": "fixture" }
+}

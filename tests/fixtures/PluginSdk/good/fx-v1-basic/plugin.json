@@ -1,0 +1,20 @@
+﻿{
+  "id": "fx-v1-basic",
+  "name": "Fixture：合法 v1 清单（无 manifest / engineApi / capabilities）",
+  "version": "1.0.0",
+  "description": "模拟 v1 老插件。硬要求：ok=true、degraded=true、warnings 里出现「按 v1 规则运行」，绝不能被拒绝。",
+  "risk": "medium",
+  "entry": { "kind": "ps1", "path": "run.ps1" },
+  "params": [
+    {
+      "name": "note",
+      "title": "备注",
+      "type": "string",
+      "required": false,
+      "default": "",
+      "secret": false,
+      "help": "仅用于演示 v1 字段（SDK 逻辑层不解析 params）。"
+    }
+  ],
+  "outputs": [ "stdout：演示输出" ]
+}

@@ -1,0 +1,11 @@
+﻿{
+  "manifest": 2,
+  "engineApi": ">=1.0 <2.0",
+  "id": "fx-unknown-cap",
+  "name": "Fixture：未知能力",
+  "version": "1.0.0",
+  "description": "capabilities 里出现能力表之外的名字 ⇒ ok=false 并点名。本清单只应产生 1 条错误。",
+  "risk": "high",
+  "capabilities": [ "read.fs", "kernel.dream.inject" ],
+  "entry": { "kind": "ps1", "path": "run.ps1" }
+}

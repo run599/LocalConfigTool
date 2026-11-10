@@ -1,0 +1,12 @@
+﻿{
+  "manifest": 2,
+  "engineApi": ">=1.0 <2.0",
+  "id": "fx-unknown-kind",
+  "name": "Fixture：未知入口种类",
+  "version": "1.0.0",
+  "description": "kinds 里出现种类注册表之外的名字 ⇒ ok=false 并点名（P0 注册表只有 ps1/exe）。本清单只应产生 1 条错误。",
+  "risk": "high",
+  "capabilities": [ "read.process" ],
+  "kinds": [ "ps1", "driver" ],
+  "entry": { "kind": "ps1", "path": "run.ps1" }
+}

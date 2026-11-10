@@ -1,0 +1,1 @@
+lct-plugin-sdk-fixture-blob-tampered

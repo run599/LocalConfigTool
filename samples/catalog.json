@@ -1,0 +1,105 @@
+{
+  "schema": 2,
+  "name": "LocalConfigTool 内置样本目录（预置规则 + 已验证 profile）",
+  "note": "这里只放规则与**纯数据 profile**（名称/CVE/来源/哈希/风险/动作结构），不放可执行载荷。载荷由 samples.get 按需获取并强制 SHA256 校验；条目若自带 profile，会在下载成功后自动落盘到 var\\driver-profiles\\，于是拿到样本就能直接发 action，不用自己写结构体 JSON。用户也可以在 var\\samples\\catalog.local.json 里追加条目（同名 id 以本地为准）。",
+  "howto": [
+    "界面：第 4 页「样本库」→ 选一行 → ① 刷新 ② 预览 ③ 获取并校验（哈希不符会丢弃）④ 生成 profile",
+    "命令行：core\\Engine.ps1 -Verb samples.list",
+    "命令行：core\\Engine.ps1 -Verb samples.get -ArgsFile a.json [-Apply]   （a.json = {\"id\":\"rtcore64-01aa278b\"}）",
+    "发动作（不加 -Apply 只预览、绝不发 IOCTL）：",
+    "  c.json = {\"profile\":\"rtcore64-01aa278b\",\"action\":\"kread\",\"payload\":\"addr=@ntoskrnl,readSize=4\"}",
+    "  core\\Engine.ps1 -Verb driver.ctl.send -ArgsFile c.json [-Apply]",
+    "payload 三种写法：JSON 对象 / 简写 key=value / 省略（用 profile 里的 presets）；值写 @ntoskrnl 自动取内核基址"
+  ],
+  "entries": [
+    {
+      "id": "rtcore64-01aa278b",
+      "name": "RTCore64.sys（MSI Afterburner 4.6.2.15658 的驱动）",
+      "cve": ["CVE-2019-16098"],
+      "tags": ["byovd", "lpe", "kernel-rw"],
+      "os": ["Windows 10 19045", "Windows 11"],
+      "capability": [
+        "任意内核内存读写（4 字节粒度）",
+        "MSR / I/O 端口读写",
+        "常被用于 BYOVD 提权与关闭 DSE"
+      ],
+      "risk": "high",
+      "verified": false,
+      "url": "",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "notes": "本机已实测：driver.use 加载成功、kread(0x80002048) 在 ntoskrnl 基址读回 0x00905A4D（MZ）。设备 \\Device\\RTCore64。测完立刻 driver.cleanup（或 driver.release -Path）。",
+      "profile": {
+        "id": "rtcore64-01aa278b",
+        "kind": "driver-profile",
+        "engineApi": 2,
+        "target": {
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "fileName": "RTCore64.sys"
+        },
+        "locate": {
+          "strategy": "symlink",
+          "candidates": ["\\??\\RTCore64"],
+          "serviceNameHint": "lctrtc64",
+          "notes": "设备名由驱动自身创建，与服务名无关"
+        },
+        "actions": {
+          "kread": {
+            "ioctl": "0x80002048",
+            "require": ["addr"],
+            "presets": { "readSize": 4, "offset": 0 },
+            "in": [
+              { "name": "pad0", "type": "bytes", "len": 8 },
+              { "name": "addr", "type": "u64" },
+              { "name": "pad1", "type": "u32" },
+              { "name": "offset", "type": "u32" },
+              { "name": "readSize", "type": "u32" },
+              { "name": "value", "type": "u32" },
+              { "name": "pad3", "type": "bytes", "len": 16 }
+            ],
+            "out": [
+              { "name": "pad0", "type": "bytes", "len": 8 },
+              { "name": "addr", "type": "u64" },
+              { "name": "pad1", "type": "u32" },
+              { "name": "offset", "type": "u32" },
+              { "name": "readSize", "type": "u32" },
+              { "name": "value", "type": "u32" },
+              { "name": "pad3", "type": "bytes", "len": 16 }
+            ]
+          }
+        },
+        "layout": { "method": "buffered", "align": 8, "endian": "little" },
+        "risk": {
+          "level": "medium",
+          "notes": "只实现读 0x80002048；结构体取自 EDRSandblast DriverRTCore.c（该文件头标注的 SHA256 与本样本一致，版本匹配）；写 0x8000204C 不实现"
+        },
+        "requires": { "restart": false, "admin": true, "elevation": "admin" }
+      }
+    },
+    {
+      "id": "placeholder-intel-ntiolib",
+      "name": "占位：Intel 某版 NTIOLib（示例条目，未填哈希）",
+      "cve": ["CVE-2015-2291"],
+      "tags": ["byovd", "placeholder"],
+      "os": ["Windows 7 / 10"],
+      "capability": ["MSR 读写（据公开资料）"],
+      "risk": "high",
+      "verified": false,
+      "url": "",
+      "sha256": "",
+      "notes": "占位条目：没有 url 与 sha256，samples.get 会明确拒绝。要启用请填入来源 URL 与 64 位 SHA256（Get-FileHash 算），并自己实测后再把 verified 改成 true。"
+    },
+    {
+      "id": "placeholder-cpuz",
+      "name": "占位：某版 CPU-Z 驱动（示例条目，未填哈希）",
+      "cve": [],
+      "tags": ["byovd", "placeholder"],
+      "os": ["Windows 10"],
+      "capability": ["I/O 端口 / 物理内存映射（据公开资料）"],
+      "risk": "medium",
+      "verified": false,
+      "url": "",
+      "sha256": "",
+      "notes": "占位条目：同上。填 url+sha256 后才允许获取。"
+    }
+  ]
+}

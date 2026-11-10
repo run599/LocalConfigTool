@@ -1,0 +1,14 @@
+﻿{
+  "manifest": 2,
+  "engineApi": ">=1.0 <2.0",
+  "id": "fx-dotdot-lifecycle",
+  "name": "Fixture：lifecycle 命令里含 .. 的路径",
+  "version": "1.0.0",
+  "description": "lifecycle.install 的命令里出现含 .. 的路径 ⇒ ok=false（禁止越出插件目录）。本清单只应产生 1 条错误。",
+  "risk": "high",
+  "capabilities": [ "read.fs" ],
+  "entry": { "kind": "ps1", "path": "run.ps1" },
+  "lifecycle": {
+    "install": "run.ps1 -Action install -Payload ..\\..\\outside.sys"
+  }
+}

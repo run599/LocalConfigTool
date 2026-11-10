@@ -1,0 +1,16 @@
+﻿{
+  "manifest": 2,
+  "engineApi": ">=1.0 <2.0",
+  "id": "fx-sha-mismatch",
+  "name": "Fixture：sha256 与实际不符",
+  "version": "1.0.0",
+  "description": "integrity.sha256 与实际文件不符 ⇒ ok=false。payload\\blob.txt 确实存在，但声明的是 64 个 0，本清单只应产生 1 条错误。",
+  "risk": "high",
+  "capabilities": [ "read.fs" ],
+  "entry": { "kind": "ps1", "path": "run.ps1" },
+  "integrity": {
+    "sha256": {
+      "payload\\blob.txt": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+}

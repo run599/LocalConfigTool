@@ -1,0 +1,16 @@
+﻿{
+  "manifest": 2,
+  "engineApi": ">=1.0 <2.0",
+  "id": "fx-sha-missing",
+  "name": "Fixture：integrity 声明的文件不存在",
+  "version": "1.0.0",
+  "description": "integrity.sha256 声明的文件不存在 ⇒ ok=false。本清单只应产生 1 条错误。",
+  "risk": "high",
+  "capabilities": [ "read.fs" ],
+  "entry": { "kind": "ps1", "path": "run.ps1" },
+  "integrity": {
+    "sha256": {
+      "payload\\absent.bin": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+}
