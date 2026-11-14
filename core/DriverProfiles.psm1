@@ -3702,6 +3702,333 @@ function Get-LctPrfJumpTable {
     return [pscustomobject]$res
 }
 
+function Get-LctPrfFunctionDisasm {
+    <#
+    .SYNOPSIS driver.desasm.function：只反汇编驱动里的一个函数（给锚点用）
+    .DESCRIPTION
+      「动态定位 → 静态精读」流水线的第二棒。
+      输入是 driver.vm.anchor 给出的 RVA（如 IOCTL 分派的 0x1450），
+      只反汇编那一段，不再全扫 .text —— 所以不存在"覆盖率"问题。
+
+      自动提取：
+        · add eax, imm32   → IOCTL 基址 = 0x100000000 - imm32
+        · cmp eax, imm     → 分派表大小 = imm + 1
+        · lea r8, [addr]   → 跳转表地址（字节表 / 偏移表）
+        · movsxd + jmp reg → 两级间接跳转
+        · cmp byte [reg], imm → IRP 类型检查（0x0E = IRP_MJ_DEVICE_CONTROL）
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Rva,
+        [int]$Bytes = 512
+    )
+    $res = [ordered]@{
+        ok = $false; path = ''; imageBase = ''; rva = ''; va = ''; fileOffset = ''
+        count = 0; disassembly = @(); features = [ordered]@{}; reason = ''; ms = 0
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    if (-not (Test-Path -LiteralPath $Path)) { $res.reason = '文件不存在'; return [pscustomobject]$res }
+    if ($Bytes -le 0) { $Bytes = 512 }
+    if ($Bytes -gt 8192) { $Bytes = 8192 }
+    $res.path = (Resolve-Path -LiteralPath $Path).ProviderPath
+
+    # ---- 1) 手工 PE 解析（不依赖 rizin，先把 RVA 映射搞对）----
+    $b = $null
+    try { $b = [IO.File]::ReadAllBytes($Path) } catch { $res.reason = '读取失败'; return [pscustomobject]$res }
+    if ($b.Length -lt 0x40 -or $b[0] -ne 0x4D -or $b[1] -ne 0x5A) { $res.reason = '不是 PE 文件'; return [pscustomobject]$res }
+    $lfanew = [BitConverter]::ToInt32($b, 0x3C)
+    if ($lfanew -le 0 -or ($lfanew + 24) -ge $b.Length) { $res.reason = 'e_lfanew 非法'; return [pscustomobject]$res }
+    if ([BitConverter]::ToUInt32($b, $lfanew) -ne 0x4550) { $res.reason = 'PE 签名不对'; return [pscustomobject]$res }
+    $numSec = [BitConverter]::ToUInt16($b, $lfanew + 6)
+    $optSize = [BitConverter]::ToUInt16($b, $lfanew + 20)
+    $optOff = $lfanew + 24
+    $magic = [BitConverter]::ToUInt16($b, $optOff)
+    $imageBase = if ($magic -eq 0x20B) { [BitConverter]::ToInt64($b, $optOff + 0x18) } else { [int64][BitConverter]::ToInt32($b, $optOff + 0x1C) }
+    $secOff = $optOff + $optSize
+    $res.imageBase = ('0x' + $imageBase.ToString('X'))
+
+    # ---- 2) RVA 解析 ----
+    $rvaVal = 0L
+    $rvaText = ([string]$Rva).Trim()
+    try {
+        if ($rvaText -match '^0[xX]') { $rvaVal = [Convert]::ToInt64($rvaText.Substring(2), 16) }
+        else { $rvaVal = [Convert]::ToInt64($rvaText, 16) }
+    } catch { $res.reason = 'RVA 解析失败: ' + $Rva; return [pscustomobject]$res }
+    $res.rva = ('0x' + $rvaVal.ToString('X'))
+    $res.va = ('0x' + ($imageBase + $rvaVal).ToString('X'))
+
+    # RVA -> 文件偏移
+    $fo = -1L
+    $secName = ''
+    for ($i = 0; $i -lt $numSec; $i++) {
+        $o = $secOff + $i * 40
+        if (($o + 40) -gt $b.Length) { break }
+        $nm = [Text.Encoding]::ASCII.GetString($b, $o, 8).TrimEnd([char]0)
+        $vs = [BitConverter]::ToInt32($b, $o + 8)
+        $va = [BitConverter]::ToInt32($b, $o + 12)
+        $ra = [BitConverter]::ToInt32($b, $o + 20)
+        if ($vs -le 0) { $vs = [BitConverter]::ToInt32($b, $o + 16) }
+        if ($rvaVal -ge $va -and $rvaVal -lt ($va + $vs)) { $fo = $ra + ($rvaVal - $va); $secName = $nm; break }
+    }
+    if ($fo -lt 0) { $res.reason = 'RVA 0x' + $rvaVal.ToString('X') + ' 不落在任何节里'; $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds; $res.ok = $true; return [pscustomobject]$res }
+    $res.fileOffset = ('0x' + $fo.ToString('X'))
+    $features = [ordered]@{ section = $secName }
+
+    # ---- 3) rizin 只反汇编这一段 ----
+    $rz = Get-LctPrfRizinPath
+    if ([string]::IsNullOrWhiteSpace($rz)) {
+        $features.rizin = 'not-found'
+        $res.features = $features
+        $res.reason = '没有 rizin，只能给出 RVA/文件偏移映射'
+        $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds; $res.ok = $true
+        return [pscustomobject]$res
+    }
+    $features.rizin = $rz
+    $addr = $imageBase + $rvaVal
+    # 注意：'pd N' 是【N 条指令】且遇跳转就停（线性流断）；'pD N' 是【N 字节】会继续往下。
+    # 分派函数开头就有一个 jne，所以必须用 pD。另外 rizin 默认带 ANSI 颜色码，必须关（Invoke-LctPrfRizin 还会再剥一次）。
+    $txt = Invoke-LctPrfRizin -RzPath $rz -CmdArgs @('-q', '-e', 'asm.lines=false', '-e', 'scr.color=0', '-c', ('pD ' + $Bytes + ' @ 0x' + $addr.ToString('X')), $res.path) -TimeoutSec 60
+
+    # ---- 4) 解析反汇编 ----
+    $insns = New-Object System.Collections.ArrayList
+    foreach ($line in ($txt -split "`r?`n")) {
+        $t = $line.Trim()
+        if ($t -eq '') { continue }
+        # 形如: 0x00011450      mov   qword [rsp + 0x10], rdx
+        if ($t -match '^(0x[0-9a-fA-F]+)\s+(\S+)(?:\s+(.*))?$') {
+            $null = $insns.Add([pscustomobject][ordered]@{
+                address = $matches[1]
+                mnemonic = $matches[2]
+                operands = [string]$matches[3]
+                text = $t
+            })
+        }
+    }
+    $res.disassembly = @($insns)
+    $res.count = @($insns).Count
+
+    # ---- 5) 特征提取 ----
+    $allText = (@($insns) | ForEach-Object { $_.text }) -join "`n"
+    # add eax, imm32  (RTCore64 的 ioctl 基址)
+    $mAdd = [regex]::Match($allText, '(?im)^\s*0x[0-9a-f]+\s+add\s+(?:eax|rax),\s*0x([0-9a-f]+)')
+    if ($mAdd.Success) {
+        $imm = [Convert]::ToInt64($mAdd.Groups[1].Value, 16)
+        $features.addImm = ('0x' + $imm.ToString('X'))
+        if ($imm -gt 0 -and $imm -lt 0x100000000L) {
+            # 典型: +0x7FFFE000 => 基址 0x80002000（32 位回绕）
+            $baseVal = (0x100000000L - $imm) -band 0xFFFFFFFFL
+            $features.ioctlBase = ('0x' + $baseVal.ToString('X'))
+        }
+    }
+    # cmp eax, imm8/imm32
+    $mCmp = [regex]::Match($allText, '(?im)^\s*0x[0-9a-f]+\s+cmp\s+(?:eax|rax),\s*0x([0-9a-f]+)')
+    if ($mCmp.Success) {
+        $imm = [Convert]::ToInt64($mCmp.Groups[1].Value, 16)
+        $features.cmpImm = ('0x' + $imm.ToString('X'))
+        $features.tableSize = [int]($imm + 1)
+        if ($null -ne $features.ioctlBase) {
+            $bVal = [Convert]::ToInt64([string]$features.ioctlBase, 16)
+            $features.ioctlRange = ('0x' + $bVal.ToString('X') + '..0x' + ($bVal + $imm).ToString('X'))
+        }
+    }
+    # lea reg, [addr]  (跳转表地址)
+    $leas = New-Object System.Collections.ArrayList
+    foreach ($m in [regex]::Matches($allText, '(?im)^\s*0x[0-9a-f]+\s+lea\s+(\w+),\s*\[(0x[0-9a-f]+)\]')) {
+        $null = $leas.Add([pscustomobject]@{ reg = $m.Groups[1].Value; address = $m.Groups[2].Value })
+    }
+    if (@($leas).Count -gt 0) { $features.leaTargets = @($leas) }
+    # movzx（字节表）/ movsxd（偏移表）
+    if ($allText -match '(?im)^\s*0x[0-9a-f]+\s+movzx\s+\w+,\s*byte\s*\[') { $features.hasByteTable = $true }
+    if ($allText -match '(?im)^\s*0x[0-9a-f]+\s+movsxd\s+\w+,\s*dword\s*\[') { $features.hasOffsetTable = $true }
+    if ($allText -match '(?im)^\s*0x[0-9a-f]+\s+jmp\s+(?:rax|eax|r\d+)') { $features.hasIndirectJump = $true }
+    $features.jumpTableKind = $(if ($features.hasByteTable -and $features.hasOffsetTable) { 'two-level' } elseif ($features.hasOffsetTable) { 'offset-only' } else { 'none' })
+    # cmp byte [reg], imm  (IRP 类型检查)
+    $mIrp = [regex]::Match($allText, '(?im)^\s*0x[0-9a-f]+\s+cmp\s+byte\s*\[[^\]]+\],\s*0x([0-9a-f]+)')
+    if ($mIrp.Success) {
+        $v = [Convert]::ToInt64($mIrp.Groups[1].Value, 16)
+        $features.irpTypeCheck = ('0x' + $v.ToString('X'))
+        $features.irpTypeName = $(switch ($v) {
+            0 { 'IRP_MJ_CREATE' } 2 { 'IRP_MJ_CLOSE' } 3 { 'IRP_MJ_READ' } 4 { 'IRP_MJ_WRITE' }
+            14 { 'IRP_MJ_DEVICE_CONTROL' } 15 { 'IRP_MJ_INTERNAL_DEVICE_CONTROL' } default { 'IRP#0x' + $v.ToString('X') }
+        })
+    }
+    # 直接调用 / 校验
+    if ($allText -match '(?im)^\s*0x[0-9a-f]+\s+call\s+') { $features.hasCall = $true }
+    $features.dispatchRecognized = ($null -ne $features.ioctlBase -and $null -ne $features.tableSize)
+    $res.features = $features
+    $res.ok = $true
+    if ($features.dispatchRecognized) {
+        $res.reason = '识别到 IOCTL 分派：基址 ' + [string]$features.ioctlBase + '，表大小 ' + [string]$features.tableSize
+    } else {
+        $res.reason = '反汇编完成，但没有识别到 add/cmp 形式的 IOCTL 分派（可能不是 IOCTL 处理函数，或用了别的比较方式）'
+    }
+    $sw.Stop()
+    $res.ms = $sw.ElapsedMilliseconds
+    return [pscustomobject]$res
+}
+
+function Get-LctPrfDispatchMap {
+    <#
+    .SYNOPSIS driver.desasm.dispatchmap：枚举跳转表，把每个 IOCTL 码映射到它的 case 分支
+    .DESCRIPTION
+      「分析」这一棒的第二步：driver.desasm.function 给出两张表的地址，
+      这里把表内容读出来，直接算出「哪个码进哪个分支」。
+
+        字节表[85]     每个码 -> case 组号
+        偏移表[group]  组号   -> 相对 case 基址的偏移
+        target = caseBase + offset[group]
+
+      输出：每个有效码 -> 处理分支 RVA；以及"默认分支"（通常是 default:，落进来的都是无效码）。
+
+      这一步不需要再反汇编 —— 表就是结论。
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Rva,
+        [string]$IoBase = '',
+        [int]$Count = 0,
+        [int]$Bytes = 600
+    )
+    $res = [ordered]@{
+        ok = $false; path = ''; imageBase = ''; ioctlBase = ''; count = 0
+        byteTableRva = ''; offsetTableRva = ''; caseBaseRva = ''
+        uniqueTargets = 0; handlers = @(); defaultTarget = ''; defaultCount = 0
+        validCodes = @(); branchCount = 0; reason = ''; ms = 0
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    if (-not (Test-Path -LiteralPath $Path)) { $res.reason = '文件不存在'; return [pscustomobject]$res }
+    $res.path = (Resolve-Path -LiteralPath $Path).ProviderPath
+
+    # ---- 1) 先做函数反汇编，拿表地址 ----
+    $fd = Get-LctPrfFunctionDisasm -Path $Path -Rva $Rva -Bytes $Bytes
+    if (-not $fd.ok) { $res.reason = '反汇编失败: ' + [string]$fd.reason; return [pscustomobject]$res }
+    $f = $fd.features
+    if (-not $f.dispatchRecognized) {
+        $res.ok = $true
+        $res.reason = '这个函数里没识别到 add/cmp 形式的跳转表分派，无法枚举：' + [string]$fd.reason
+        $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds
+        return [pscustomobject]$res
+    }
+    $res.imageBase = [string]$fd.imageBase
+    $res.ioctlBase = [string]$f.ioctlBase
+    $cnt = $Count
+    if ($cnt -le 0) { $cnt = [int]$f.tableSize }
+    if ($cnt -le 0) { $cnt = 1 }
+    $res.count = $cnt
+    if ([string]::IsNullOrWhiteSpace($IoBase)) { $IoBase = [string]$f.ioctlBase }
+
+    # ---- 2) 从 leaTargets 里认三张地址（按 lea 出现顺序：字节表 / 偏移表 / case 基址）----
+    $leas = @($f.leaTargets)
+    if (@($leas).Count -lt 3) {
+        $res.ok = $true
+        $res.reason = ('识别到分派，但只发现 ' + @($leas).Count + ' 个 lea 目标，不足以枚举表（需要字节表/偏移表/case基址三个）')
+        $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds
+        return [pscustomobject]$res
+    }
+    $imageBase = [Convert]::ToInt64([string]$fd.imageBase, 16)
+    $bRva = [Convert]::ToInt64([string]$leas[0].address, 16) - $imageBase
+    $oRva = [Convert]::ToInt64([string]$leas[1].address, 16) - $imageBase
+    $cRva = [Convert]::ToInt64([string]$leas[2].address, 16) - $imageBase
+    $res.byteTableRva = ('0x' + $bRva.ToString('X'))
+    $res.offsetTableRva = ('0x' + $oRva.ToString('X'))
+    $res.caseBaseRva = ('0x' + $cRva.ToString('X'))
+
+    # ---- 3) 手工 PE 解析 + 读表 ----
+    $b = $null
+    try { $b = [IO.File]::ReadAllBytes($Path) } catch { $res.reason = '读取失败'; return [pscustomobject]$res }
+    $lfanew = [BitConverter]::ToInt32($b, 0x3C)
+    $numSec = [BitConverter]::ToUInt16($b, $lfanew + 6)
+    $optSize = [BitConverter]::ToUInt16($b, $lfanew + 20)
+    $secOff = $lfanew + 24 + $optSize
+    $rva2fo = {
+        param([int64]$rva)
+        for ($k = 0; $k -lt $numSec; $k++) {
+            $o = $secOff + $k * 40
+            if (($o + 40) -gt $b.Length) { break }
+            $vs = [BitConverter]::ToInt32($b, $o + 8)
+            $va = [BitConverter]::ToInt32($b, $o + 12)
+            $ra = [BitConverter]::ToInt32($b, $o + 20)
+            if ($vs -le 0) { $vs = [BitConverter]::ToInt32($b, $o + 16) }
+            if ($rva -ge $va -and $rva -lt ($va + $vs)) { return ($ra + ($rva - $va)) }
+        }
+        return -1
+    }
+    $foB = & $rva2fo $bRva
+    $foO = & $rva2fo $oRva
+    if ($foB -lt 0 -or $foO -lt 0) {
+        $res.ok = $true; $res.reason = '表地址不在任何节里（可能不是文件里的静态表）'
+        $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds
+        return [pscustomobject]$res
+    }
+
+    # 读字节表（count 项）
+    if (($foB + $cnt) -gt $b.Length) {
+        $res.ok = $true; $res.reason = '字节表越界（count=' + $cnt + ' 超出文件）'
+        $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds
+        return [pscustomobject]$res
+    }
+    $byteTable = New-Object 'byte[]' $cnt
+    [Array]::Copy($b, [int]$foB, $byteTable, 0, $cnt)
+    $maxGroup = 0
+    foreach ($g in $byteTable) { if ($g -gt $maxGroup) { $maxGroup = [int]$g } }
+    # 读偏移表（maxGroup+1 个 dword）
+    $needBytes = ($maxGroup + 1) * 4
+    if (($foO + $needBytes) -gt $b.Length) {
+        $res.ok = $true; $res.reason = '偏移表越界（组号最大 ' + $maxGroup + '）'
+        $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds
+        return [pscustomobject]$res
+    }
+
+    # ---- 4) 建映射 ----
+    $ioBaseVal = 0L
+    $tmpBase = ([string]$IoBase) -replace '^0[xX]', ''
+    try { $ioBaseVal = [Convert]::ToInt64($tmpBase, 16) } catch { $ioBaseVal = 0 }
+    $map = @{}
+    $order = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $cnt; $i++) {
+        $g = [int]$byteTable[$i]
+        $off = [BitConverter]::ToInt32($b, [int]$foO + $g * 4)
+        $tgt = $cRva + $off
+        $code = $ioBaseVal + $i
+        if (-not $map.ContainsKey($tgt)) {
+            $map[$tgt] = New-Object System.Collections.ArrayList
+            $null = $order.Add($tgt)
+        }
+        $null = $map[$tgt].Add($code)
+    }
+
+    # ---- 5) 找默认分支（落进来的码最多）----
+    $defTgt = -1; $defCnt = -1
+    foreach ($k in $order) {
+        $c = @($map[$k]).Count
+        if ($c -gt $defCnt) { $defCnt = $c; $defTgt = $k }
+    }
+    $handlers = New-Object System.Collections.ArrayList
+    $valid = New-Object System.Collections.ArrayList
+    foreach ($k in ($order | Sort-Object)) {
+        $codes = @($map[$k] | ForEach-Object { '0x' + $_.ToString('X').ToUpper() })
+        $isDef = ($k -eq $defTgt)
+        $null = $handlers.Add([pscustomobject][ordered]@{
+            targetRva = ('0x' + ([int64]$k).ToString('X'))
+            isDefault = $isDef
+            count     = $codes.Count
+            ioctls    = $codes
+        })
+        if (-not $isDef) { foreach ($c in $codes) { $null = $valid.Add($c) } }
+    }
+    $res.handlers = @($handlers)
+    $res.uniqueTargets = @($order).Count
+    $res.defaultTarget = ('0x' + ([int64]$defTgt).ToString('X'))
+    $res.defaultCount = $defCnt
+    $res.validCodes = @($valid)
+    $res.branchCount = @($order).Count - 1
+    $res.ok = $true
+    $res.reason = ('枚举完成：' + $res.branchCount + ' 个有效分支，' + @($valid).Count + ' 个有效码，' + $defCnt + ' 个码落到默认分支 ' + $res.defaultTarget)
+    $sw.Stop()
+    $res.ms = $sw.ElapsedMilliseconds
+    return [pscustomobject]$res
+}
+
 Export-ModuleMember -Function Get-LctDriverProfileList, Get-LctDriverProfileShow, Test-LctDriverProfile,
     New-LctDriverProfileDraft, Get-LctDriverDevices, Invoke-LctDriverCtl, Get-LctDriverCtlVerify,
-    Save-LctDriverProfile, Get-LctKernelBaseAddress, ConvertTo-LctPrfBuffer, Get-LctPrfJumpTable, Get-LctPrfRizinPath
+    Save-LctDriverProfile, Get-LctKernelBaseAddress, ConvertTo-LctPrfBuffer, Get-LctPrfJumpTable, Get-LctPrfRizinPath, Get-LctPrfFunctionDisasm, Get-LctPrfDispatchMap

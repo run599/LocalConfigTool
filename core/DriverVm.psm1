@@ -557,6 +557,173 @@ function Invoke-LctVmProbe {
 
 # ---------------- verb: snapshot ----------------
 
+function Invoke-LctVmAnchor {
+    <#
+    .SYNOPSIS driver.vm.anchor：用 kread 读内核对象，拿 DRIVER_OBJECT / MajorFunction[]
+    .DESCRIPTION
+      「动态定位 → 静态精读 → 动态验证」流水线的第一棒。
+
+      借已知漏洞驱动（RTCore64 之类）的 kread 原语：
+        handle -> FILE_OBJECT -> DEVICE_OBJECT -> DRIVER_OBJECT
+        -> DriverName / DriverStart / DriverSize / MajorFunction[0..27]
+      直接给出 IRP_MJ_DEVICE_CONTROL 的精确 RVA（反汇编起点），
+      不需要暴力扫 IOCTL 码（driver.vm.discover），也不需要猜从哪开始反汇编。
+
+      崩溃是结论，不是失败：VM 里代价是 30 秒回滚。
+      预览模式（不加 -Apply）不发任何 IOCTL。
+    #>
+    param(
+        [string]$SysPath = '',
+        [string]$Name = 'target.sys',
+        [string]$Device = '',
+        [string]$Service = '',
+        [string]$Ioctl = '',
+        [switch]$NoLoad,
+        [int]$TimeoutSec = 0,
+        [switch]$Apply
+    )
+    $verb = 'driver.vm.anchor'
+    $warnings = New-Object System.Collections.ArrayList
+    $errors = New-Object System.Collections.ArrayList
+    $ready = Test-LctVmReady
+    if (-not $ready.ok) { return New-LctResult -Verb $verb -Warnings @($warnings) -Errors @($ready.reasons) }
+    $auth = $ready.auth
+    $vmx = $ready.config.vmx
+    $gd = [string]$ready.config.guestDir
+    if ([string]::IsNullOrWhiteSpace($Name)) { $Name = 'target.sys' }
+    if ([string]::IsNullOrWhiteSpace($Device)) { $Device = '\.\RTCore64' }
+    if ([string]::IsNullOrWhiteSpace($Service)) { $Service = 'lctanchor' }
+    if ($TimeoutSec -le 0) { $TimeoutSec = 180 }
+    $guestAnchorPs = Join-Path $gd 'anchor.ps1'
+    $guestAnchorJson = Join-Path $gd 'anchor.json'
+    $guestSys = Join-Path $gd $Name
+    $hostAnchorPs = Join-Path $script:LctVmRoot 'tools\vm-agent\guest-anchor.ps1'
+    $psG = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+
+    if (-not (Test-Path -LiteralPath $hostAnchorPs)) {
+        return New-LctResult -Verb $verb -Warnings @($warnings) -Errors @('找不到 tools\vm-agent\guest-anchor.ps1')
+    }
+
+    if (-not $Apply) {
+        $data = [pscustomobject][ordered]@{
+            applied    = $false
+            guestSys   = $(if ([string]::IsNullOrWhiteSpace($SysPath)) { '（不加载，假定已加载）' } else { $guestSys })
+            guestScript = $guestAnchorPs
+            guestResult = $guestAnchorJson
+            device     = $Device
+            service    = $Service
+            ioctl      = $(if ($Ioctl -ne '') { $Ioctl } else { '0x80002048（RTCore64 kread 默认）' })
+            noLoad     = [bool]$NoLoad
+            timeoutSec = $TimeoutSec
+            wouldDo    = @(
+                '推 guest-anchor.ps1 到 ' + $guestAnchorPs
+                $(if (-not $NoLoad -and $SysPath -ne '') { '推 ' + $SysPath + ' 到 ' + $guestSys + '，并 sc create/start 加载' } else { '不加载驱动（-NoLoad 或未给 -SysPath）' })
+                '在 guest 里跑: & ''' + $guestAnchorPs + '''（环境变量 LCT_SYS / LCT_DEVICES / LCT_SVC / LCT_IOCTL / LCT_NOLOAD）'
+                '拉回 ' + $guestAnchorJson
+                '输出: DriverName / DriverStart / DriverSize / MajorFunction[0..27] / 能力面 / IOCTL 分派 RVA'
+            )
+            note = '预览。加 -Apply 才真跑（会在 guest 里加载驱动并发 kread）。拿不到 DRIVER_OBJECT 时会如实报错，不会瞎猜。'
+        }
+        return New-LctResult -Verb $verb -Warnings @($warnings) -Errors @($errors) -Data $data
+    }
+
+    # 推送脚本
+    $pushSteps = New-Object System.Collections.ArrayList
+    $rcDir = Invoke-LctVmRun -Params @('createDirectoryInGuest', $vmx, $gd) -User $auth.user -Pass $auth.pass -TimeoutSec 30
+    $null = $pushSteps.Add('mkdir: ' + $(if ($rcDir.ok) { 'ok' } else { 'exists/err' }))
+    $rcPs = Invoke-LctVmRun -Params @('copyFileFromHostToGuest', $vmx, (Resolve-Path -LiteralPath $hostAnchorPs).ProviderPath, $guestAnchorPs) -User $auth.user -Pass $auth.pass -TimeoutSec 90
+    $null = $pushSteps.Add('push anchor.ps1: ' + $(if ($rcPs.ok) { 'ok' } else { $rcPs.out }))
+    if (-not $rcPs.ok) { return New-LctResult -Verb $verb -Warnings @($warnings) -Errors @('推送 guest-anchor.ps1 失败: ' + $rcPs.out) }
+    $loadDriver = (-not $NoLoad) -and (-not [string]::IsNullOrWhiteSpace($SysPath))
+    if ($loadDriver) {
+        if (-not (Test-Path -LiteralPath $SysPath)) {
+            return New-LctResult -Verb $verb -Warnings @($warnings) -Errors @('要加载的 .sys 不存在: ' + $SysPath)
+        }
+        $rcSys = Invoke-LctVmRun -Params @('copyFileFromHostToGuest', $vmx, (Resolve-Path -LiteralPath $SysPath).ProviderPath, $guestSys) -User $auth.user -Pass $auth.pass -TimeoutSec 180
+        $null = $pushSteps.Add('push sys: ' + $(if ($rcSys.ok) { 'ok' } else { $rcSys.out }))
+        if (-not $rcSys.ok) { return New-LctResult -Verb $verb -Warnings @($warnings) -Errors @('推送 .sys 失败: ' + $rcSys.out) }
+    }
+
+    # 构造 -Command
+    $envParts = New-Object System.Collections.ArrayList
+    if ($loadDriver) { $null = $envParts.Add("`$env:LCT_SYS='" + $guestSys + "'") }
+    $null = $envParts.Add("`$env:LCT_DEVICES='" + $Device + "'")
+    $null = $envParts.Add("`$env:LCT_SVC='" + $Service + "'")
+    if ($Ioctl -ne '') { $null = $envParts.Add("`$env:LCT_IOCTL='" + $Ioctl + "'") }
+    if ($NoLoad) { $null = $envParts.Add("`$env:LCT_NOLOAD='1'") }
+    $null = $envParts.Add("`$env:LCT_OUT='" + $guestAnchorJson + "'")
+    $cmdText = ($envParts -join '; ') + ('; & ''' + $guestAnchorPs + '''')
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $run = Invoke-LctVmRun -Params @('runProgramInGuest', $vmx, $psG, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $cmdText) -User $auth.user -Pass $auth.pass -TimeoutSec $TimeoutSec
+    $sw.Stop()
+    $elapsed = [int]$sw.ElapsedMilliseconds
+
+    # 崩溃判定：先看 tools
+    $toolsAfter = Invoke-LctVmRun -Params @('checkToolsState', $vmx) -TimeoutSec 30
+    $crashed = $false
+    $crashReason = ''
+    if ($toolsAfter.out -notmatch '(?i)running') { $crashed = $true; $crashReason = 'VMware Tools 不在 running: ' + $toolsAfter.out }
+    elseif (-not $run.ok) { $crashReason = 'runProgramInGuest 失败: ' + $run.out }
+
+    # 拉结果
+    $outPath = Join-Path $env:TEMP ('lct-vm-anchor-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.json')
+    $pull = Invoke-LctVmRun -Params @('copyFileFromGuestToHost', $vmx, $guestAnchorJson, $outPath) -User $auth.user -Pass $auth.pass -TimeoutSec 60
+    $result = $null
+    if ($pull.ok -and (Test-Path -LiteralPath $outPath)) {
+        try { $result = Get-Content -LiteralPath $outPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $result = $null }
+    }
+    try { if (Test-Path -LiteralPath $outPath) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($outPath, 'OnlyErrorDialogs', 'SendToRecycleBin') } } catch { }
+
+    if ($crashed) {
+        $data = [pscustomobject][ordered]@{
+            applied = $true
+            verdict = 'crash'
+            crashReason = $crashReason
+            guestSys = $(if ($loadDriver) { $guestSys } else { '' })
+            elapsedMs = $elapsed
+            note = 'VM 崩了。这是结论（说明读到了不该读的地址或驱动自身崩了）。回滚快照后可重试。'
+        }
+        $null = $warnings.Add('VM 崩溃: ' + $crashReason)
+        return New-LctResult -Verb $verb -Warnings @($warnings) -Errors @($errors) -Data $data
+    }
+    if ($null -eq $result) {
+        $data = [pscustomobject][ordered]@{ applied = $true; verdict = 'no-result'; runOutput = $run.out; elapsedMs = $elapsed }
+        $null = $errors.Add('guest 没有产出 anchor.json（脚本可能早退）')
+        return New-LctResult -Verb $verb -Warnings @($warnings) -Errors @($errors) -Data $data
+    }
+
+    $verdict = $(if ($result.ok) { 'anchored' } else { 'failed' })
+    $cap = $result.capability
+    $data = [pscustomobject][ordered]@{
+        applied        = $true
+        verdict        = $verdict
+        driverName     = [string]$result.driverName
+        driverObject   = [string]$result.driverObject
+        deviceObject   = [string]$result.deviceObject
+        fileObject     = [string]$result.fileObject
+        driverStart    = [string]$result.driverStart
+        driverSize     = [string]$result.driverSize
+        device         = [string]$result.device
+        ioctlDispatchRva = $(if ($null -ne $cap) { [string]$cap.ioctlDispatchRva } else { '' })
+        hasDeviceControl = $(if ($null -ne $cap) { [bool]$cap.hasDeviceControl } else { $false })
+        capability     = $cap
+        majorFunctions = @($result.majorFunctions)
+        selfCheck      = $result.selfCheck
+        kreadCalls     = [int]$result.kreadCalls
+        elapsedMs      = $elapsed
+        pushSteps      = @($pushSteps)
+    }
+    if ($result.error) { $null = $errors.Add([string]$result.error) }
+    if ($verdict -eq 'anchored' -and $null -ne $cap) {
+        if (-not $cap.hasDeviceControl) {
+            $null = $warnings.Add('这个设备的 MajorFunction[14] 不在驱动内（指向 ntoskrnl 的默认处理）⇒ 它不处理 IRP_MJ_DEVICE_CONTROL，发 IOCTL 没有意义。')
+        } else {
+            $null = $warnings.Add('IOCTL 分派函数 RVA = ' + [string]$cap.ioctlDispatchRva + '（下一步：只反汇编这一段，不要全扫 .text）')
+        }
+    }
+    return New-LctResult -Verb $verb -Warnings @($warnings) -Errors @($errors) -Data $data
+}
 function Set-LctVmSnapshot {
     <#
     .SYNOPSIS driver.vm.snapshot：打快照 / 回滚快照 / 列快照
@@ -622,6 +789,8 @@ function Invoke-LctVmMatrix {
         [int]$MaxVariants = 40,
         [int]$PerVariantTimeoutSec = 60,
         [string]$GuestSys = '',
+        [string]$Codes = '',
+        [int]$MaxCodes = 64,
         [switch]$Apply
     )
     $verb = 'driver.vm.matrix'
@@ -665,7 +834,54 @@ function Invoke-LctVmMatrix {
     $ioctlText = [string](Get-LctVmProp $act 'ioctl' '')
     if ([string]::IsNullOrWhiteSpace($ioctlText)) { return New-LctResult -Verb $verb -Errors @('action 没有 ioctl 码') }
 
+
+    # ---- 码表模式：dispatchmap 给出的精确码 -> 每个码一条任务 ----
+    # 「反哺动态」：不再盲扫/猜码，只测静态表证明有效的那些。
+    # 注意：New-LctVmPack 读的是 variant.values（不是 payload），所以这里填 profile 的 presets，
+    # 否则字段全 0 -> readSize=0 -> 驱动空转 -> 每个码都"成功"，结论全假。
+    $codesList = @()
+    if (-not [string]::IsNullOrWhiteSpace($Codes)) {
+        $codesList = @(([string]$Codes) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+        if (@($codesList).Count -eq 0) { return New-LctResult -Verb $verb -Errors @('-Codes 解析后为空') }
+        if (@($codesList).Count -gt $MaxCodes) {
+            $null = $warnings.Add('码表 ' + @($codesList).Count + ' 个超过 -MaxCodes ' + $MaxCodes + '，只测前 ' + $MaxCodes + ' 个')
+            $codesList = @($codesList | Select-Object -First $MaxCodes)
+        }
+        $presetsObj = $null
+        try { $presetsObj = Get-LctVmProp $act 'presets' $null } catch { $presetsObj = $null }
+        if ($null -eq $presetsObj) {
+            $null = $warnings.Add('profile 的 action 没有 presets：每个码都会用全 0 payload 发送，驱动可能空转（readSize=0），结论不可信。建议先给 action 补 presets。')
+        }
+        # 把 presets 展开成字典，并自动给"地址类字段"填 @ntoskrnl。
+        # 不填的话 addr=0 -> 驱动做 NULL 检查 -> 每个码都返回 87，看起来"全无效"，其实是空转。
+        $baseVals = @{}
+        if ($presetsObj -is [System.Collections.IDictionary]) {
+            foreach ($pk in @($presetsObj.Keys)) { $baseVals[[string]$pk] = $presetsObj[$pk] }
+        } elseif ($null -ne $presetsObj) {
+            foreach ($pp in @($presetsObj.PSObject.Properties)) { $baseVals[[string]$pp.Name] = $pp.Value }
+        }
+        $addrFields = @()
+        foreach ($fld in @($inFields)) {
+            $fn = [string](Get-LctVmProp $fld 'name' '')
+            if ($fn -match '(?i)^(addr|address|base|ptr|pointer|target)$' -and -not $baseVals.ContainsKey($fn)) {
+                $baseVals[$fn] = '@ntoskrnl'
+                $addrFields += $fn
+            }
+        }
+        if (@($addrFields).Count -gt 0) { $null = $warnings.Add('码表模式：地址类字段 ' + (@($addrFields) -join ',') + ' 自动用 @ntoskrnl（guest 侧填真实内核基址）') }
+        $variants = @($codesList | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    mutation = ('code-' + $_)
+                    values   = $baseVals
+                    risk     = ''
+                    ioctl    = [string]$_
+                    level    = 'code'
+                }
+            })
+        $null = $warnings.Add('码表模式：按 dispatchmap 给的 ' + @($codesList).Count + ' 个码逐个实测（不用 ctl.variants 的变异）')
+    }
     $wantLevels = @(([string]$Levels) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    if (@($codesList).Count -gt 0) { $wantLevels += 'code' }
 
     if (-not $Apply) {
         $plan = New-Object System.Collections.ArrayList
@@ -673,9 +889,11 @@ function Invoke-LctVmMatrix {
             $mut = [string]$v.mutation
             $lvl = Get-LctVmLevel -Mutation $mut
             if ($wantLevels -notcontains $lvl) { continue }
+            $oneIoctl = $ioctlText
+            if ($null -ne $v.PSObject.Properties['ioctl'] -and -not [string]::IsNullOrWhiteSpace([string]$v.ioctl)) { $oneIoctl = [string]$v.ioctl }
             $pack = New-LctVmPack -InFields $inFields -Layout $layout -Variant $v
             $null = $plan.Add([pscustomobject][ordered]@{
-                    mutation = $mut; level = $lvl; payload = [string]$v.payload
+                    mutation = $mut; level = $lvl; payload = [string]$v.payload; ioctl = $oneIoctl
                     inSize = $(if ($null -ne $pack) { $pack.size } else { 0 })
                     inHex = $(if ($null -ne $pack) { $pack.hex } else { '' })
                     patch = $(if ($null -ne $pack) { $pack.patch } else { '' })
@@ -723,7 +941,10 @@ function Invoke-LctVmMatrix {
         # 组装 -Command（vmrun 的 -File 不可靠，必须 -Command）
         $parts = New-Object System.Collections.ArrayList
         $null = $parts.Add("`$env:LCT_SYS='$GuestSys'")
-        $null = $parts.Add("`$env:LCT_IOCTL='$ioctlText'")
+        # 码表模式下每个任务自带 ioctl；否则用 profile 的 action.ioctl
+        $oneIoctl = $ioctlText
+        if ($null -ne $v.PSObject.Properties['ioctl'] -and -not [string]::IsNullOrWhiteSpace([string]$v.ioctl)) { $oneIoctl = [string]$v.ioctl }
+        $null = $parts.Add("`$env:LCT_IOCTL='" + $oneIoctl + "'")
         $null = $parts.Add("`$env:LCT_INHEX='$($pack.hex)'")
         if ($pack.patch -ne '') { $null = $parts.Add("`$env:LCT_PATCH='$($pack.patch)'") }
         $cmdText = ($parts -join '; ') + ('; & ''' + $guestProbe + '''')
@@ -743,7 +964,7 @@ function Invoke-LctVmMatrix {
         $hung = ($run.timedOut -and -not $vmDead)
 
         $one = [ordered]@{
-            mutation = $mut; level = $lvl; payload = [string]$v.payload
+            mutation = $mut; level = $lvl; payload = [string]$v.payload; ioctl = $oneIoctl
             inSize = $pack.size; inHex = $pack.hex; patch = $pack.patch
             verdict = ''; detail = ''; win32Error = 0; bytesReturned = 0; outHex = ''; elapsedMs = $elapsed
             crashed = $crashed; timedOut = [bool]$run.timedOut
@@ -863,6 +1084,8 @@ function Get-LctVmProp {
 
 function Get-LctVmLevel {
     param([string]$Mutation)
+    # 码表模式（driver.vm.matrix -Codes）：每个码一条，级别是 code
+    if ($Mutation -like 'code-*') { return 'code' }
     # 先判组合变异（addr-max-size-zero 同时含 addr 前缀，放后面会被误判成 address）
     if ($Mutation -eq 'addr-max-size-zero' -or $Mutation -like 'cross-page-*') { return 'cross-page' }
     if ($Mutation -like 'size-*') { return 'boundary' }
@@ -880,8 +1103,15 @@ function New-LctVmPack {
     try {
         $raw = Get-LctVmProp $Variant 'values' $null
         if ($null -ne $raw) {
-            foreach ($p in @($raw.PSObject.Properties)) {
-                $vals[[string]$p.Name] = $p.Value
+            # 坑：presets 从 profile 读出来是 OrderedDictionary（不是 PSCustomObject）。
+            # 直接遍历 PSObject.Properties 会拿到字典自己的 Count/Keys/Values，键值对全丢，
+            # 结果是 payload 全 0 -> readSize=0 -> 驱动空转 -> 每个码都"成功"。
+            if ($raw -is [System.Collections.IDictionary]) {
+                foreach ($k in @($raw.Keys)) { $vals[[string]$k] = $raw[$k] }
+            } else {
+                foreach ($p in @($raw.PSObject.Properties)) {
+                    $vals[[string]$p.Name] = $p.Value
+                }
             }
         }
     } catch { }
@@ -2291,4 +2521,4 @@ function Invoke-LctVmExplore {
     return New-LctResult -Verb $verb -Warnings @($warnings) -Errors @($errors) -Data $data
 }
 
-Export-ModuleMember -Function Invoke-LctVmConfig, Get-LctVmStatus, Initialize-LctVmGuest, Push-LctVmDriver, Invoke-LctVmProbe, Set-LctVmSnapshot, Invoke-LctVmMatrix, Invoke-LctVmFields, Invoke-LctVmBatch, Invoke-LctVmDiscover, Invoke-LctVmFromProbe, Invoke-LctVmExplore, Get-LctVmBatchTasks, Get-LctVmDeps
+Export-ModuleMember -Function Invoke-LctVmConfig, Get-LctVmStatus, Initialize-LctVmGuest, Push-LctVmDriver, Invoke-LctVmProbe, Invoke-LctVmAnchor, Set-LctVmSnapshot, Invoke-LctVmMatrix, Invoke-LctVmFields, Invoke-LctVmBatch, Invoke-LctVmDiscover, Invoke-LctVmFromProbe, Invoke-LctVmExplore, Get-LctVmBatchTasks, Get-LctVmDeps

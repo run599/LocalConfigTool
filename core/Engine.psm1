@@ -174,6 +174,17 @@ $script:LctVerbTable += @(
     [pscustomobject]@{ verb = 'driver.profile.draft'; summary = '静态起草 profile（只读；产物是草案，不可直接执行）'; mutating = $false; args = @(
             [pscustomobject]@{ name = 'path'; type = 'string'; required = $true }
         ) }
+    [pscustomobject]@{ verb = 'driver.desasm.function'; summary = '只反汇编驱动里的一个函数（输入 RVA，如 anchor 给的 IOCTL 分派 RVA）；自动提取 IOCTL 基址/表大小/跳转表地址；纯静态、只读' ; mutating = $false; args = @(
+            [pscustomobject]@{ name = 'path'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'rva'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'bytes'; type = 'int'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.desasm.dispatchmap'; summary = '枚举跳转表，把每个 IOCTL 码映射到 case 分支（输入 RVA；表地址自动从 desasm.function 拿）；纯静态、只读'; mutating = $false; args = @(
+            [pscustomobject]@{ name = 'path'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'rva'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'ioBase'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'count'; type = 'int'; required = $false }
+        ) }
     [pscustomobject]@{ verb = 'driver.devices'; summary = '解析服务的 .sys 路径与候选控制入口（只测试能否打开，不发 IOCTL）'; mutating = $false; args = @(
             [pscustomobject]@{ name = 'name'; type = 'string'; required = $true }
         ) }
@@ -282,6 +293,15 @@ $script:LctVerbTable += @(
             [pscustomobject]@{ name = 'devices'; type = 'string'; required = $false }
             [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
         ) }
+    [pscustomobject]@{ verb = 'driver.vm.anchor'; summary = 'kread 读 DRIVER_OBJECT / MajorFunction[]，给出 IRP_MJ_DEVICE_CONTROL 的精确 RVA（锚点）；不暴力扫码也不猜反汇编起点（默认预览，-Apply 才执行）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'sysPath'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'name'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'device'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'service'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'ioctl'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'noLoad'; type = 'bool'; required = $false }
+            [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
+        ) }
     [pscustomobject]@{ verb = 'driver.vm.snapshot'; summary = '打快照/回滚快照/列快照（回滚会丢弃 VM 当前状态，必须 -Apply）'; mutating = $true; args = @(
             [pscustomobject]@{ name = 'create'; type = 'string'; required = $false }
             [pscustomobject]@{ name = 'revertTo'; type = 'string'; required = $false }
@@ -294,6 +314,8 @@ $script:LctVerbTable += @(
             [pscustomobject]@{ name = 'maxVariants'; type = 'int'; required = $false }
             [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
             [pscustomobject]@{ name = 'guestSys'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'codes'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'maxCodes'; type = 'int'; required = $false }
         ) }
     [pscustomobject]@{ verb = 'driver.vm.fields'; summary = '差分探测：逐块改 payload，推 in 字段布局（哪些偏移有效、多宽；语义仍需人工命名）'; mutating = $true; args = @(
             [pscustomobject]@{ name = 'ioctl'; type = 'string'; required = $true }
@@ -332,7 +354,6 @@ $script:LctVerbTable += @(
             [pscustomobject]@{ name = 'step'; type = 'int'; required = $false }
             [pscustomobject]@{ name = 'inSize'; type = 'int'; required = $false }
             [pscustomobject]@{ name = 'blockSize'; type = 'int'; required = $false }
-            [pscustomobject]@{ name = 'maxCodes'; type = 'int'; required = $false }
             [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
             [pscustomobject]@{ name = 'skipMatrix'; type = 'bool'; required = $false }
         ) }
@@ -702,6 +723,21 @@ function Invoke-LctEngine {
                 if ($null -ne $pl -and $pl -isnot [string]) { $pl = ($pl | ConvertTo-Json -Depth 8 -Compress) }
                 return Invoke-LctDriverCtl -Profile (Get-LctArgValue $a 'profile') -Action (Get-LctArgValue $a 'action') -Payload ([string]$pl) -OverrideBsod:(ConvertTo-LctBool (Get-LctArgValue $a 'overrideBsod')) -Apply:$Apply
             }
+            'driver.desasm.function' {
+                $dPath = [string](Get-LctArgValue $a 'path')
+                $dRva = [string](Get-LctArgValue $a 'rva')
+                $dBytes = 512
+                try { $dBytes = [int](Get-LctArgValue $a 'bytes') } catch { $dBytes = 512 }
+                return Use-LctModuleReturn -Verb $Verb -R (Get-LctPrfFunctionDisasm -Path $dPath -Rva $dRva -Bytes $dBytes)
+            }
+            'driver.desasm.dispatchmap' {
+                $mPath = [string](Get-LctArgValue $a 'path')
+                $mRva = [string](Get-LctArgValue $a 'rva')
+                $mIoBase = [string](Get-LctArgValue $a 'ioBase')
+                $mCnt = 0
+                try { $mCnt = [int](Get-LctArgValue $a 'count') } catch { $mCnt = 0 }
+                return Use-LctModuleReturn -Verb $Verb -R (Get-LctPrfDispatchMap -Path $mPath -Rva $mRva -IoBase $mIoBase -Count $mCnt)
+            }
             'driver.ctl.variants' {
                 $vP = [string](Get-LctArgValue $a 'profile')
                 $vA = [string](Get-LctArgValue $a 'action')
@@ -753,6 +789,17 @@ function Invoke-LctEngine {
                 try { $pTo = [int](Get-LctArgValue $a 'timeoutSec') } catch { $pTo = 0 }
                 return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmProbe -GuestSys $pSysP -Ioctl $pIoctl -ReadSize $pRs -Addr $pAddr -Devices $pDevs -TimeoutSec $pTo -Apply:$Apply)
             }
+            'driver.vm.anchor' {
+                $aSys = [string](Get-LctArgValue $a 'sysPath')
+                $aName = [string](Get-LctArgValue $a 'name')
+                $aDev = [string](Get-LctArgValue $a 'device')
+                $aSvc = [string](Get-LctArgValue $a 'service')
+                $aIoctl = [string](Get-LctArgValue $a 'ioctl')
+                $aNoLoad = ConvertTo-LctBool (Get-LctArgValue $a 'noLoad')
+                $aTo = 0
+                try { $aTo = [int](Get-LctArgValue $a 'timeoutSec') } catch { $aTo = 0 }
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmAnchor -SysPath $aSys -Name $aName -Device $aDev -Service $aSvc -Ioctl $aIoctl -NoLoad:$aNoLoad -TimeoutSec $aTo -Apply:$Apply)
+            }
             'driver.vm.snapshot' {
                 $sCreate = [string](Get-LctArgValue $a 'create')
                 $sRevert = [string](Get-LctArgValue $a 'revertTo')
@@ -769,7 +816,10 @@ function Invoke-LctEngine {
                 $mTo = 60
                 try { $mt = Get-LctArgValue $a 'timeoutSec'; if ($null -ne $mt -and [string]$mt -ne '') { $mTo = [int]$mt } } catch { $mTo = 60 }
                 $mSys = [string](Get-LctArgValue $a 'guestSys')
-                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmMatrix -Profile $mProf -Action $mAct -Levels $mLv -MaxVariants $mMax -PerVariantTimeoutSec $mTo -GuestSys $mSys -Apply:$Apply)
+                $mxCodes = [string](Get-LctArgValue $a 'codes')
+                $mxMaxCodes = 64
+                try { $mxc = Get-LctArgValue $a 'maxCodes'; if ($null -ne $mxc -and [string]$mxc -ne '') { $mxMaxCodes = [int]$mxc } } catch { $mxMaxCodes = 64 }
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmMatrix -Profile $mProf -Action $mAct -Levels $mLv -MaxVariants $mMax -PerVariantTimeoutSec $mTo -GuestSys $mSys -Codes $mxCodes -MaxCodes $mxMaxCodes -Apply:$Apply)
             }
             'driver.vm.fields' {
                 $fIoctl = [string](Get-LctArgValue $a 'ioctl')
