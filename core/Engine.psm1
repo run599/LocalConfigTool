@@ -14,7 +14,7 @@ $script:LctCore = $PSScriptRoot
 $script:LctLoadErrors = New-Object System.Collections.ArrayList
 $script:LctLoaded = New-Object System.Collections.ArrayList
 
-foreach ($m in @('Logging', 'Backup', 'Registry', 'Accounts', 'Plugins', 'PluginSdk', 'Processes', 'Wdac', 'WatchHost', 'Drivers', 'DriverProfiles', 'DriverMap', 'Capabilities', 'Ai', 'Samples')) {
+foreach ($m in @('Logging', 'Backup', 'Registry', 'Accounts', 'Plugins', 'PluginSdk', 'Processes', 'Wdac', 'WatchHost', 'Drivers', 'DriverProfiles', 'DriverMap', 'Capabilities', 'Ai', 'Samples', 'DriverAudit', 'DriverProbe', 'DriverVm')) {
     $path = Join-Path $script:LctCore ($m + '.psm1')
     if (-not (Test-Path -LiteralPath $path)) { continue }
     try {
@@ -247,6 +247,103 @@ $script:LctVerbTable += @(
     ) },
     [pscustomobject]@{ verb = 'driver.ctl.verify'; summary = 'canary 握手（默认只做文件指纹证明；加 -Apply 才真发 canary IOCTL）'; mutating = $true; args = @(
             [pscustomobject]@{ name = 'profile'; type = 'string'; required = $true }
+        ) },
+    [pscustomobject]@{ verb = 'driver.ctl.variants'; summary = '从 profile 的 in 布局自动生成 IOCTL 变异包（baseline/边界/地址/跨页；不发 IOCTL）'; mutating = $false; args = @(
+            [pscustomobject]@{ name = 'profile'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'action'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'maxVariants'; type = 'int'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.ctl.probe'; summary = '按变异层次逐条发 IOCTL 并如实记录（默认预览，-Apply 才发；畸形包可能蓝屏）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'profile'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'action'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'levels'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'maxVariants'; type = 'int'; required = $false }
+        ) },
+    [pscustomobject]@{ verb = 'driver.vm.config'; summary = 'VM 沙箱配置（vmrun 路径/vmx/guest 用户；密码只落 DPAPI，不写日志）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'vmrun'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'vmx'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'guestUser'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'guestPassword'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'clearPassword'; type = 'bool'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.vm.status'; summary = 'VM 是否在跑 / Tools 状态 / 快照列表 / guest 环境（只读）'; mutating = $false; args = @() }
+    [pscustomobject]@{ verb = 'driver.vm.prepare'; summary = '一次性准备 guest：建工作目录 + Defender 排除 + 报告 testsigning'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'skipDefender'; type = 'bool'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.vm.push'; summary = '把 .sys 与探测脚本送进 guest（默认预览，-Apply 才复制）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'path'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'name'; type = 'string'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.vm.probe'; summary = '在 guest 里加载驱动并发 IOCTL，拉回结果；crash = VM 崩了/超时（默认预览，-Apply 才执行）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'guestSys'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'ioctl'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'readSize'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'addr'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'devices'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.vm.snapshot'; summary = '打快照/回滚快照/列快照（回滚会丢弃 VM 当前状态，必须 -Apply）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'create'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'revertTo'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'list'; type = 'bool'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.vm.matrix'; summary = '把 ctl.variants 的变异逐个送进 VM 跑完整个矩阵（每条独立超时；崩了就停）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'profile'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'action'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'levels'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'maxVariants'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'guestSys'; type = 'string'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.vm.fields'; summary = '差分探测：逐块改 payload，推 in 字段布局（哪些偏移有效、多宽；语义仍需人工命名）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'ioctl'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'inSize'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'blockSize'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'patch'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'readSize'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'guestSys'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'safeMode'; type = 'bool'; required = $false }
+            [pscustomobject]@{ name = 'aggressive'; type = 'bool'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.vm.batch'; summary = '批量跑多个驱动的变异矩阵；崩溃后自动回滚快照重建环境继续（需 -Snapshot）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'dir'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'profiles'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'snapshot'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'levels'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'maxVariants'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'maxDrivers'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'maxMinutes'; type = 'int'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.vm.discover'; summary = '暴力扫 IOCTL 码：没有 profile 时靠遍历码范围 + 观察响应找入口（ok-data 确定有效）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'guestSys'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'devices'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'base'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'count'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'step'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'inSize'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.vm.explore'; summary = '全自动探索：给一个 .sys，自动扫码+探布局+跑变异，输出「实际能做什么」的能力报告（不需要 profile/不需要审定）'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'sysPath'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'base'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'count'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'step'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'inSize'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'blockSize'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'maxCodes'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'skipMatrix'; type = 'bool'; required = $false }
+        ) }
+    [pscustomobject]@{ verb = 'driver.profile.fromprobe'; summary = '把 dispatch + 差分探测结果合成 draft profile（自动填 method/out/presets/sha；字段语义仍需人工）；产物 needsReview 不能直接执行'; mutating = $true; args = @(
+            [pscustomobject]@{ name = 'sysPath'; type = 'string'; required = $true }
+            [pscustomobject]@{ name = 'ioctl'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'inSize'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'blockSize'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'actionName'; type = 'string'; required = $false }
+            [pscustomobject]@{ name = 'timeoutSec'; type = 'int'; required = $false }
+            [pscustomobject]@{ name = 'snapshot'; type = 'string'; required = $false }
         ) }
 )
 # --- 12.x 新增能力：自定义驱动加载（签名只做信息展示，能否加载交给系统判定并如实回传） ---
@@ -258,6 +355,13 @@ $script:LctVerbTable += @(
     [pscustomobject]@{ verb = 'driver.info'; summary = '单个 .sys 的 hash/签名摘要（不作为加载门槛）'; mutating = $false; args = @(
             [pscustomobject]@{ name = 'path'; type = 'string'; required = $true }
         ) }
+    [pscustomobject]@{ verb = 'driver.batch.scan'; summary = '静态批量鉴定一个目录里的 .sys（不加载/不发 IOCTL/零蓝屏）：L0 无效 / L1 无信号 / L2 有设备 / L3 有 IOCTL 候选'; mutating = $false; args = @(
+        [pscustomobject]@{ name = 'dir'; type = 'string'; required = $true }
+        [pscustomobject]@{ name = 'pattern'; type = 'string'; required = $false }
+        [pscustomobject]@{ name = 'maxFiles'; type = 'int'; required = $false }
+        [pscustomobject]@{ name = 'recurse'; type = 'bool'; required = $false }
+        [pscustomobject]@{ name = 'skipDraft'; type = 'bool'; required = $false }
+    ) },
     [pscustomobject]@{ verb = 'driver.load'; summary = '指定 .sys 并加载（注册+启动；签名交给系统判定并如实回传错误原文）'; mutating = $true; args = @(
             [pscustomobject]@{ name = 'path'; type = 'string'; required = $true }
             [pscustomobject]@{ name = 'name'; type = 'string'; required = $false }
@@ -569,6 +673,15 @@ function Invoke-LctEngine {
             'driver.status' { return Use-LctModuleReturn -Verb $Verb -R (Get-LctDriverStatus) }
             'driver.list' { return Use-LctModuleReturn -Verb $Verb -R (Get-LctDriverList -Name (Get-LctArgValue $a 'name')) }
             'driver.info' { return Use-LctModuleReturn -Verb $Verb -R (Get-LctDriverFileInfo -Path (Get-LctArgValue $a 'path')) }
+            'driver.batch.scan' {
+                $bDir = [string](Get-LctArgValue $a 'dir')
+                $bPat = [string](Get-LctArgValue $a 'pattern'); if ([string]::IsNullOrWhiteSpace($bPat)) { $bPat = '*.sys' }
+                $bMax = 200
+                try { $bx = Get-LctArgValue $a 'maxFiles'; if ($null -ne $bx -and [string]$bx -ne '') { $bMax = [int]$bx } } catch { $bMax = 200 }
+                $bRec = ConvertTo-LctBool (Get-LctArgValue $a 'recurse')
+                $bSkip = ConvertTo-LctBool (Get-LctArgValue $a 'skipDraft')
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctDriverBatchScan -Dir $bDir -Pattern $bPat -MaxFiles $bMax -Recurse:$bRec -SkipDraft:$bSkip)
+            }
             'driver.load' {
                 $st = Get-LctArgValue $a 'startType'; if (-not $st) { $st = 'demand' }
                 return Load-LctDriver -Path (Get-LctArgValue $a 'path') -Name (Get-LctArgValue $a 'name') -StartType ([string]$st) -Stage:(ConvertTo-LctBool (Get-LctArgValue $a 'stage')) -Override:(ConvertTo-LctBool (Get-LctArgValue $a 'override')) -Apply:$Apply
@@ -589,7 +702,157 @@ function Invoke-LctEngine {
                 if ($null -ne $pl -and $pl -isnot [string]) { $pl = ($pl | ConvertTo-Json -Depth 8 -Compress) }
                 return Invoke-LctDriverCtl -Profile (Get-LctArgValue $a 'profile') -Action (Get-LctArgValue $a 'action') -Payload ([string]$pl) -OverrideBsod:(ConvertTo-LctBool (Get-LctArgValue $a 'overrideBsod')) -Apply:$Apply
             }
+            'driver.ctl.variants' {
+                $vP = [string](Get-LctArgValue $a 'profile')
+                $vA = [string](Get-LctArgValue $a 'action')
+                $vMax = 40
+                try { $vx = Get-LctArgValue $a 'maxVariants'; if ($null -ne $vx -and [string]$vx -ne '') { $vMax = [int]$vx } } catch { $vMax = 40 }
+                return Use-LctModuleReturn -Verb $Verb -R (New-LctCtlPayloadVariants -Profile $vP -Action $vA -MaxVariants $vMax)
+            }
+            'driver.ctl.probe' {
+                $pP = [string](Get-LctArgValue $a 'profile')
+                $pA = [string](Get-LctArgValue $a 'action')
+                $pL = [string](Get-LctArgValue $a 'levels')
+                if ([string]::IsNullOrWhiteSpace($pL)) { $pL = 'baseline,boundary,address,cross-page' }
+                $pMax = 40
+                try { $px = Get-LctArgValue $a 'maxVariants'; if ($null -ne $px -and [string]$px -ne '') { $pMax = [int]$px } } catch { $pMax = 40 }
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctCtlProbe -Profile $pP -Action $pA -Levels $pL -MaxVariants $pMax -Apply:$Apply)
+            }
             'driver.ctl.verify' { return Use-LctModuleReturn -Verb $Verb -R (Get-LctDriverCtlVerify -Profile (Get-LctArgValue $a 'profile')) }
+            'driver.vm.config' {
+                $cVmrun = [string](Get-LctArgValue $a 'vmrun')
+                $cVmx = [string](Get-LctArgValue $a 'vmx')
+                $cUser = [string](Get-LctArgValue $a 'guestUser')
+                $cPass = [string](Get-LctArgValue $a 'guestPassword')
+                $cClear = ConvertTo-LctBool (Get-LctArgValue $a 'clearPassword')
+                $cTo = 0
+                try { $cTo = [int](Get-LctArgValue $a 'timeoutSec') } catch { $cTo = 0 }
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmConfig -Vmrun $cVmrun -Vmx $cVmx -GuestUser $cUser -GuestPassword $cPass -TimeoutSec $cTo -ClearPassword:$cClear -Apply:$Apply)
+            }
+            'driver.vm.status' {
+                return Use-LctModuleReturn -Verb $Verb -R (Get-LctVmStatus)
+            }
+            'driver.vm.prepare' {
+                $pSkipDef = ConvertTo-LctBool (Get-LctArgValue $a 'skipDefender')
+                return Use-LctModuleReturn -Verb $Verb -R (Initialize-LctVmGuest -SkipDefender:$pSkipDef -Apply:$Apply)
+            }
+            'driver.vm.push' {
+                $pVmPath = [string](Get-LctArgValue $a 'path')
+                $pVmName = [string](Get-LctArgValue $a 'name')
+                if ([string]::IsNullOrWhiteSpace($pVmName)) { $pVmName = 'target.sys' }
+                return Use-LctModuleReturn -Verb $Verb -R (Push-LctVmDriver -Path $pVmPath -Name $pVmName -Apply:$Apply)
+            }
+            'driver.vm.probe' {
+                $pSysP = [string](Get-LctArgValue $a 'guestSys')
+                $pIoctl = [string](Get-LctArgValue $a 'ioctl')
+                $pRs = 0
+                try { $pRs = [int](Get-LctArgValue $a 'readSize') } catch { $pRs = 0 }
+                $pAddr = [string](Get-LctArgValue $a 'addr')
+                $pDevs = [string](Get-LctArgValue $a 'devices')
+                $pTo = 0
+                try { $pTo = [int](Get-LctArgValue $a 'timeoutSec') } catch { $pTo = 0 }
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmProbe -GuestSys $pSysP -Ioctl $pIoctl -ReadSize $pRs -Addr $pAddr -Devices $pDevs -TimeoutSec $pTo -Apply:$Apply)
+            }
+            'driver.vm.snapshot' {
+                $sCreate = [string](Get-LctArgValue $a 'create')
+                $sRevert = [string](Get-LctArgValue $a 'revertTo')
+                $sList = ConvertTo-LctBool (Get-LctArgValue $a 'list')
+                return Use-LctModuleReturn -Verb $Verb -R (Set-LctVmSnapshot -Create $sCreate -RevertTo $sRevert -List:$sList -Apply:$Apply)
+            }
+            'driver.vm.matrix' {
+                $mProf = [string](Get-LctArgValue $a 'profile')
+                $mAct = [string](Get-LctArgValue $a 'action')
+                $mLv = [string](Get-LctArgValue $a 'levels')
+                if ([string]::IsNullOrWhiteSpace($mLv)) { $mLv = 'baseline,boundary,address,cross-page' }
+                $mMax = 40
+                try { $mx = Get-LctArgValue $a 'maxVariants'; if ($null -ne $mx -and [string]$mx -ne '') { $mMax = [int]$mx } } catch { $mMax = 40 }
+                $mTo = 60
+                try { $mt = Get-LctArgValue $a 'timeoutSec'; if ($null -ne $mt -and [string]$mt -ne '') { $mTo = [int]$mt } } catch { $mTo = 60 }
+                $mSys = [string](Get-LctArgValue $a 'guestSys')
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmMatrix -Profile $mProf -Action $mAct -Levels $mLv -MaxVariants $mMax -PerVariantTimeoutSec $mTo -GuestSys $mSys -Apply:$Apply)
+            }
+            'driver.vm.fields' {
+                $fIoctl = [string](Get-LctArgValue $a 'ioctl')
+                $fInSize = 48
+                try { $fx = Get-LctArgValue $a 'inSize'; if ($null -ne $fx -and [string]$fx -ne '') { $fInSize = [int]$fx } } catch { $fInSize = 48 }
+                $fBlock = 4
+                try { $fy = Get-LctArgValue $a 'blockSize'; if ($null -ne $fy -and [string]$fy -ne '') { $fBlock = [int]$fy } } catch { $fBlock = 4 }
+                $fPatch = [string](Get-LctArgValue $a 'patch')
+                $fRs = 0
+                try { $fz = Get-LctArgValue $a 'readSize'; if ($null -ne $fz -and [string]$fz -ne '') { $fRs = [int]$fz } } catch { $fRs = 0 }
+                $fSys = [string](Get-LctArgValue $a 'guestSys')
+                $fTo = 45
+                try { $fw = Get-LctArgValue $a 'timeoutSec'; if ($null -ne $fw -and [string]$fw -ne '') { $fTo = [int]$fw } } catch { $fTo = 45 }
+                $fSafe = ConvertTo-LctBool (Get-LctArgValue $a 'safeMode')
+                $fAgg = ConvertTo-LctBool (Get-LctArgValue $a 'aggressive')
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmFields -GuestSys $fSys -Ioctl $fIoctl -InSize $fInSize -BlockSize $fBlock -Patch $fPatch -ReadSize $fRs -TimeoutSec $fTo -SafeMode:$fSafe -Aggressive:$fAgg -Apply:$Apply)
+            }
+            'driver.vm.batch' {
+                $bDir = [string](Get-LctArgValue $a 'dir')
+                $bProfs = [string](Get-LctArgValue $a 'profiles')
+                $bSnap = [string](Get-LctArgValue $a 'snapshot')
+                $bLv = [string](Get-LctArgValue $a 'levels')
+                if ([string]::IsNullOrWhiteSpace($bLv)) { $bLv = 'baseline,boundary,address,cross-page' }
+                $bMv = 40
+                try { $bx = Get-LctArgValue $a 'maxVariants'; if ($null -ne $bx -and [string]$bx -ne '') { $bMv = [int]$bx } } catch { $bMv = 40 }
+                $bTo = 45
+                try { $by = Get-LctArgValue $a 'timeoutSec'; if ($null -ne $by -and [string]$by -ne '') { $bTo = [int]$by } } catch { $bTo = 45 }
+                $bMd = 10
+                try { $bz2 = Get-LctArgValue $a 'maxDrivers'; if ($null -ne $bz2 -and [string]$bz2 -ne '') { $bMd = [int]$bz2 } } catch { $bMd = 10 }
+                $bMm = 30
+                try { $bw2 = Get-LctArgValue $a 'maxMinutes'; if ($null -ne $bw2 -and [string]$bw2 -ne '') { $bMm = [int]$bw2 } } catch { $bMm = 30 }
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmBatch -Dir $bDir -Profiles $bProfs -Snapshot $bSnap -Levels $bLv -MaxVariants $bMv -TimeoutSec $bTo -MaxDrivers $bMd -MaxMinutes $bMm -Apply:$Apply)
+            }
+            'driver.vm.discover' {
+                $dSys = [string](Get-LctArgValue $a 'guestSys')
+                $dDev = [string](Get-LctArgValue $a 'devices')
+                $dBase = [string](Get-LctArgValue $a 'base')
+                if ([string]::IsNullOrWhiteSpace($dBase)) { $dBase = '0x80002000' }
+                $dCnt = 64
+                try { $dx = Get-LctArgValue $a 'count'; if ($null -ne $dx -and [string]$dx -ne '') { $dCnt = [int]$dx } } catch { $dCnt = 64 }
+                $dStep = 4
+                try { $dy = Get-LctArgValue $a 'step'; if ($null -ne $dy -and [string]$dy -ne '') { $dStep = [int]$dy } } catch { $dStep = 4 }
+                $dIsz = 48
+                try { $dz = Get-LctArgValue $a 'inSize'; if ($null -ne $dz -and [string]$dz -ne '') { $dIsz = [int]$dz } } catch { $dIsz = 48 }
+                $dTo = 8
+                try { $dw = Get-LctArgValue $a 'timeoutSec'; if ($null -ne $dw -and [string]$dw -ne '') { $dTo = [int]$dw } } catch { $dTo = 8 }
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmDiscover -GuestSys $dSys -Devices $dDev -Base $dBase -Count $dCnt -Step $dStep -InSize $dIsz -TimeoutSec $dTo -Apply:$Apply)
+            }
+            'driver.vm.explore' {
+                $eSys = [string](Get-LctArgValue $a 'sysPath')
+                $eBase = [string](Get-LctArgValue $a 'base')
+                if ([string]::IsNullOrWhiteSpace($eBase)) { $eBase = '0x80002000' }
+                $eCnt = 32
+                try { $ex = Get-LctArgValue $a 'count'; if ($null -ne $ex -and [string]$ex -ne '') { $eCnt = [int]$ex } } catch { $eCnt = 32 }
+                $eStep = 4
+                try { $ey = Get-LctArgValue $a 'step'; if ($null -ne $ey -and [string]$ey -ne '') { $eStep = [int]$ey } } catch { $eStep = 4 }
+                $eIsz = 48
+                try { $ez = Get-LctArgValue $a 'inSize'; if ($null -ne $ez -and [string]$ez -ne '') { $eIsz = [int]$ez } } catch { $eIsz = 48 }
+                $eBlk = 4
+                try { $eb = Get-LctArgValue $a 'blockSize'; if ($null -ne $eb -and [string]$eb -ne '') { $eBlk = [int]$eb } } catch { $eBlk = 4 }
+                $eMc = 3
+                try { $em = Get-LctArgValue $a 'maxCodes'; if ($null -ne $em -and [string]$em -ne '') { $eMc = [int]$em } } catch { $eMc = 3 }
+                $eTo = 20
+                try { $et = Get-LctArgValue $a 'timeoutSec'; if ($null -ne $et -and [string]$et -ne '') { $eTo = [int]$et } } catch { $eTo = 20 }
+                $eSkip = ConvertTo-LctBool (Get-LctArgValue $a 'skipMatrix')
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmExplore -SysPath $eSys -Base $eBase -Count $eCnt -Step $eStep -InSize $eIsz -BlockSize $eBlk -MaxCodes $eMc -TimeoutSec $eTo -SkipMatrix:$eSkip -Apply:$Apply)
+            }
+            'driver.profile.fromprobe' {
+                $pSys = [string](Get-LctArgValue $a 'sysPath')
+                $pIoctl = [string](Get-LctArgValue $a 'ioctl')
+                $pIsz = 48
+                try { $px = Get-LctArgValue $a 'inSize'; if ($null -ne $px -and [string]$px -ne '') { $pIsz = [int]$px } } catch { $pIsz = 48 }
+                $pBlk = 4
+                try { $py = Get-LctArgValue $a 'blockSize'; if ($null -ne $py -and [string]$py -ne '') { $pBlk = [int]$py } } catch { $pBlk = 4 }
+                $pAct = [string](Get-LctArgValue $a 'actionName')
+                if ([string]::IsNullOrWhiteSpace($pAct)) { $pAct = 'auto' }
+                $pTo = 30
+                try { $pz = Get-LctArgValue $a 'timeoutSec'; if ($null -ne $pz -and [string]$pz -ne '') { $pTo = [int]$pz } } catch { $pTo = 30 }
+                $pSnap = [string](Get-LctArgValue $a 'snapshot')
+                $pPatch = [string](Get-LctArgValue $a 'patch')
+                return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctVmFromProbe -SysPath $pSys -Ioctl $pIoctl -InSize $pIsz -BlockSize $pBlk -ActionName $pAct -TimeoutSec $pTo -Patch $pPatch -Snapshot $pSnap -Apply:$Apply)
+            }
+
                                                 'driver.kernelbase' { return Use-LctModuleReturn -Verb $Verb -R (New-LctResult -Verb $Verb -Data (Get-LctKernelBaseAddress)) }
                                     'driver.use' {
                 return Use-LctModuleReturn -Verb $Verb -R (Invoke-LctDriverUse -Path (Get-LctArgValue $a 'path') -Name (Get-LctArgValue $a 'name') -StartType (Get-LctArgValue $a 'startType') -Apply:$Apply)

@@ -1,63 +1,63 @@
-﻿> ## 本仓库是「MCP 工具」，不是恶意项目
+﻿# LocalConfigTool
+
+> **一个 MCP 工具，不是恶意项目。**
 >
-> LocalConfigTool 是一个 Windows 系统分析与本地配置管理工具，同时是一个标准
-> **MCP（Model Context Protocol）服务器**（`tools\McpServer.ps1`，JSON-RPC over stdio）。
-> 它不自我传播、不隐藏、不窃取数据；写操作默认只预览，必须显式 `-Apply`，
-> AI 场景还需人给一次性确认短语；每次写入前自动备份、可回滚、全程审计。
+> Windows 系统分析与本地配置管理工具 + 标准 **MCP（Model Context Protocol）服务器**。
+> AI 宿主（Claude Desktop / Cursor / DSH 等）通过 JSON-RPC over stdio 挂载它，用自然语言驱动系统操作。
 >
-> ## 公开版与完整版的差别（只差两样「具体载荷」）
+> **不是恶意软件**：不自我传播、不隐藏、不驻留、不窃取数据；**不预置** exploit 或漏洞驱动二进制；
+> 写操作默认只预览、必须显式 `-Apply`；每次写入前自动备份、可回滚、全程审计；用完可一键清理。
 >
-> **工具本体与能力完整保留**：68 个 verb、驱动/对象图/profile 引擎、WDAC、AI 接入、MCP、UI、23 道门禁测试。
+> 定位类似火绒剑（HRSword）：把系统能力交给使用者，由使用者决定做什么。
 >
-> 只把下面两样改为**使用者自备**：
-> - 某个具体 CVE 的**可执行 exploit** → `plugins\cve-2026-49176` 是占位实现（用 `-PocDir` 指向你自己的 PoC）
-> - **现成的漏洞驱动下载链** → `samples\catalog.json` 的真实 URL / SHA256 已清空（填你自己的）
+> ---
 >
-> 因为「具备驱动加载能力」和「预置某个具体 exploit」是两件事：前者是**工具**
-> （火绒剑同样自带驱动、能操作内核），后者属于**具体利用代码**，不适合随公开仓库分发。
->
-> ## 使用边界
->
-> - 仅在**你完全拥有处置权**的机器上使用（虚拟机 / 快照最佳）
-> - 驱动加载与内核操作有蓝屏风险，工具默认**只预览**，必须显式 `-Apply`
-> - 使用者自行承担全部责任；请勿用于未授权的系统
+> **本文档是唯一的项目文档，包含理解与修改本项目所需的全部信息。没有第二个文件需要读。**
+> 读完本文你就能理解这个项目的能力边界、安全模型和扩展方式。
 
 ---
-# LocalConfigTool
 
-> ## 一个 MCP 工具，不是恶意项目
->
-> LocalConfigTool 是一个 Windows **系统分析与本地配置管理工具**，同时是一个标准的
-> **MCP（Model Context Protocol）服务器**：AI 宿主（Claude Desktop / Cursor / DSH 等）可以
-> 通过 JSON-RPC over stdio 挂载它，用自然语言驱动系统操作。
->
-> 它**不是**恶意软件 / 攻击载荷：
->
-> - 不自我传播、不隐藏、不驻留、不窃取数据
-> - **不预置**任何 exploit 或漏洞驱动二进制（样本按需获取，且强制 SHA256 校验）
-> - 所有写操作**默认只预览**，必须显式 `-Apply`；AI 场景还需人给一次性确认短语
-> - 每次写入前自动备份、可回滚、全程审计日志（`var\logs\`）
-> - 用完可一键清理（`driver.cleanup` 只卸本工具加载过的服务）
->
-> 定位类似火绒剑（HRSword）这类系统分析工具：**把系统能力交给使用者，由使用者决定做什么**。
-> 它不是"自动帮你攻击"的东西，而是"把系统内部摊开给你看、让你操作，并且允许你反悔"的工具。
+## 0. 先看这个：能力全貌（两段式权限跃迁）
 
-## 三种用法
+这是本项目最核心的设计，**不要把它当成"进程管理工具"**。
+
+```
+普通用户 ──(第一段：提权插件 plugins.run)──> 管理员/SYSTEM ──(第二段：driver.use + ctl.send)──> 内核任意读写
+         ↑ 起点必须是非提权                               ↑ 起点必须是管理员/SYSTEM
+```
+
+| | **第一段：提权** | **第二段：内核** |
+|---|---|---|
+| 触发 | `plugins.run`（`plugins\cve-2026-49176`） | `driver.use` → `driver.verify` → `driver.ctl.send` |
+| 起点 | **普通用户**（必须非提权） | **管理员 / SYSTEM** |
+| 终点 | **管理员 / SYSTEM** | **内核原语（任意读写 / 执行）** |
+| 代码位置 | `core\Plugins.psm1` + `plugins\` | `core\Drivers.psm1` + `core\DriverProfiles.psm1` |
+
+**两段的权限前提正好相反**，这是关键：
+
+```powershell
+# core\Ai.psm1 L66 —— 提权插件必须在非提权上下文跑
+if ($v -eq 'plugins.run') { return 'non-elevated' }
+```
+
+所以完整的链路只能是「**先提权，再加载驱动**」。`ai.plan` 会自动排出这个顺序；
+`process.kill` 只是这条链上**最末端、最不值钱**的一环（同权限用户态终止），不是本项目的天花板。
+
+> 更细的冲突处理与每步前置条件，在各模块头部注释里（`core\Plugins.psm1` / `core\Drivers.psm1`）。
+
+---
+
+## 1. 三种用法
 
 | 用法 | 入口 | 说明 |
 |---|---|---|
-| **图形界面** | `ui-java\run.cmd`（需 JDK 21）或 `run-ui.cmd` | Java Swing 界面，7 页 |
-| **命令行** | `engine.cmd -Verb <verb> [-ArgsFile <json>] [-Apply]` | 68 个 verb，与界面等价 |
-| **MCP（给 AI 用）** | `tools\McpServer.ps1` | JSON-RPC over stdio，暴露 4 个工具 |
+| **图形界面** | `ui-java\run.cmd`（需 JDK 21）或 `run-ui.cmd` | Java Swing，7 页 |
+| **命令行** | `engine.cmd -Verb <verb> [-ArgsFile <json>] [-Apply]` | 83 个 verb，与界面等价 |
+| **MCP（给 AI 用）** | `tools\McpServer.ps1` | JSON-RPC 2.0 over stdio，暴露 4 个工具 |
 
+> 旧的 WinForms 界面（`ui\ConfigUI.ps1`）仍可运行，但不再更新。
 
-## MCP 接口（本项目的核心身份之一）
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\McpServer.ps1
-```
-
-标准 **JSON-RPC 2.0 over stdio**（每行一条消息），暴露 4 个工具（渐进披露，不把 68 个 verb 塞给模型）：
+### MCP 接口（4 个工具）
 
 | 工具 | 作用 |
 |---|---|
@@ -66,210 +66,236 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\McpServer.ps1
 | `lct_plan` | 一句话目标 → 有序执行计划（只读；为第一个可执行写步骤发一次性确认短语） |
 | `lct_call` | 执行 verb；`mutating` + `apply=true` 必须带人给的 `confirm` 短语 |
 
-**为什么 AI 需要这一层**：AI 直接裸调引擎也能跑，但拿不到"现在能不能做 / 该按什么顺序做"的元信息，
-也绕不过确认闸门。MCP 层把这两件事固化成协议。详见 `docs\AI-INTERFACE.md`。
+**为什么 AI 需要这一层**：裸调引擎也能跑，但拿不到"现在能不能做 / 该按什么顺序做"的元信息，
+也绕不过确认闸门。MCP 层把这两件事固化成协议。
 
-```
-run-ui.cmd / ui-java\run.cmd  →  图形界面
-engine.cmd                    →  引擎命令行（界面也是调它）
-tools\McpServer.ps1           →  MCP 服务器（AI 宿主挂载）
-plugins\                      →  插件（每个插件一个目录 + plugin.json）
-presets\                      →  预设包（数据驱动，加 JSON 即可扩展）
-var\                          →  日志、备份、已下载样本（运行数据：不入库、勿分发）
-```
-
-## 快速开始
-
-**界面**：双击 `run-ui.cmd`（界面里所有写操作默认只**预览**，要再点一次「应用」并确认才落盘）。
-
-**命令行**（界面能做的命令行都能做）：
+### 命令行示例
 
 ```bat
-engine.cmd engine.verbs
-engine.cmd account.status -Out text
-engine.cmd account.admin -ArgsFile "%TEMP%\args.json" -Apply
-engine.cmd plugins.list
+engine.cmd -Verb engine.verbs          :: 83 个 verb 的完整清单（含参数）
+engine.cmd -Verb capability.status     :: 当前权限（是否管理员 / 能否加载驱动）
+engine.cmd -Verb samples.list          :: 样本库（预置规则）
+engine.cmd -Verb ai.manifest           :: AI 可直接调用的能力
 ```
 
-参数含引号/反斜杠时**务必走文件**：
-
-```powershell
-@{ path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'; name = 'ProductName' } |
-  ConvertTo-Json -Compress | Set-Content "$env:TEMP\args.json" -Encoding UTF8
-```
-```bat
-engine.cmd registry.get -ArgsFile "%TEMP%\args.json"
-```
-> 内联 JSON（`-Args '{"path":"HKCU:\\Software"}'`）在**跨进程命令行层**会被转义规则破坏
-> （实测报 `Invalid JSON primitive: HKCU.`），所以引擎专门提供 `-ArgsFile`。界面固定用文件通道。
-
-## 现有能力（`engine.verbs` 可自描述，界面据此生成）
-
-| 分类 | verb | 说明 |
-|---|---|---|
-| 账户与登录 | `account.status` | 账户 / 管理员组 / UAC / 自动登录 快照 |
-| | `account.admin` | 内置 Administrator 启用 / 禁用 |
-| | `account.uac` | UAC 开关（改 EnableLUA、提示行为等四项，**需重启生效**） |
-| | `account.autologon` | 自动登录开关（口令只从 `passwordFile` 读） |
-| 注册表 | `registry.get` / `registry.set` / `registry.delete` | 任意路径读 / 写 / 删（支持 String/ExpandString/DWord/QWord/MultiString/Binary） |
-| 预设包 | `presets.list` / `presets.show` / `presets.apply` | 数据驱动的预设项，可整包或单项预览/应用 |
-| 提权工具 | `plugins.list` / `plugins.show` / `plugins.run` | 列出 / 看详情 / 预览命令 / 执行（执行需 `-Apply`） |
-| 备份 | `backup.list` / `backup.show` / `backup.restore` | 列出 / 看详情 / 预览或执行还原 |
-| 引擎 | `engine.verbs` | 自描述：verb 表、可用性、装载错误、路径、是否提权 |
-
-## 安全设计（这几条是工具的地基）
-
-1. **默认只预览**：所有写类 verb 不带 `-Apply` 时**绝不落盘**，只回显 `changes`（含 before/after）。
-2. **先备份后写**：真实写入前必定先建备份，结果里给出 `backupId`；`var\backups\<id>\` 内含
-   `meta.json` + 注册表 `.reg` 导出（若备份时键不存在，则记 `.reg.absent`，还原时会把该键删掉）。
-3. **可回滚**：`backup.restore -Apply` 走 `reg import` / 删键；账户类改动另存快照
-   `account-before.json`，由账户模块还原（口令不可还原，会在 `warnings` 说明）。
-4. **不永久删除**：文件/目录删除只走**回收站**（`Move-LctToRecycleBin`）；注册表键删除用
-   `Remove-LctRegistryKeyTree`（刻意不用 `Remove-Item`——本机删除守卫会拦截，且这是铁律）。
-5. **不碰口令**：自动登录口令只从文件读，绝不进命令行、日志、备份 meta、返回 JSON
-   （备份只记 `hasPassword`），并在 `warnings` 里提示 `AutoAdminLogon` 明文存盘的风险。
-6. **插件显式执行**：`plugins.run` 不带 `-Apply` 只回显解析后的命令行，**不启动任何进程**；
-   执行需要显式加 `-Apply`。
-7. **日志**：每次调用都写 `var\logs\engine-YYYYMMDD.log`（JSON Lines），返回里的 `log` 字段给出路径。
-
-## 插件规范（后端可插拔的底座）
-
-`plugins\<id>\plugin.json`：
-
-```json
-{
-  "id": "cve-2026-49176",
-  "name": "CVE-2026-49176 WalletService 提权",
-  "version": "1.0",
-  "description": "本地提权 PoC（WalletService → SYSTEM）",
-  "risk": "lab-only",
-  "note": "仅限自有测试环境使用",
-  "entry": { "kind": "ps1", "path": "run.ps1" },
-  "params": [
-    { "name": "timeout", "title": "超时(秒)", "type": "int", "required": false, "default": 120, "help": "上限 600" }
-  ],
-  "outputs": [ "成功后看 PoC 运行目录下 payload\\result.txt 的 user=SYSTEM" ]
-}
-```
-
-- `entry.kind` 支持 `ps1` / `exe`；`path` 相对插件目录。
-- 参数替换用 `{name}` 占位；`type=secret` 的参数在日志与返回 JSON 里只显示 `***`。
-- 放一个新目录进去就等于新增一个工具，界面下拉里会出现。
-
-## 预设包规范
-
-`presets\<任意名>.json`（可以是单个包，也可以是包数组）：
-
-```json
-{
-  "id": "account-login",
-  "name": "账户与登录",
-  "description": "UAC / 内置 Administrator / 自动登录",
-  "risk": "medium",
-  "items": [
-    { "id": "uac-off", "title": "关闭 UAC", "summary": "需重启", "verb": "account.uac", "args": { "enable": false } }
-  ]
-}
-```
-
-## 自测与维护命令
+参数复杂时用文件传（避免引号/中文转义）：
 
 ```bat
-rem 端到端验收（只动 HKCU 一次性键，退出码=失败项数）
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\SelfTest.ps1
-
-rem 编码归一化：给丢了 BOM 的 .ps1/.psm1/.json/.md 补 BOM，并检查 .cmd 是否纯 ASCII
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\Fix-Encoding.ps1
-
-rem 前端自检（不开窗口，验证界面能构建且引擎可达）
-powershell -NoProfile -ExecutionPolicy Bypass -File ui\ConfigUI.ps1 -SelfCheck
+echo {"goal":"加载 rtcore64 读内核头，最后清理"} > a.json
+engine.cmd -Verb ai.plan -ArgsFile a.json
 ```
 
-## 常见问题
+---
 
-- **中文变乱码 / 脚本报 “The string is missing the terminator”**：文件丢了 BOM，Windows
-  PowerShell 5.1 会按 GBK 读。跑一次 `tests\Fix-Encoding.ps1` 即可；用编辑工具改完含中文的文件后都要跑。
-- **参数报 `Invalid JSON primitive`**：用了内联 JSON。改用 `-ArgsFile`。
-- **UAC 改完没生效**：需要重启（`account.uac` 会在 `warnings` 里说明）。
-- **`account.admin` 无效**：需要管理员权限；结果里 `errors`/`warnings` 会说明，界面「概览」页显示是否提权。
-- **`engine.verbs` 的 `availability` 有 false**：对应模块装载失败，`loadErrors` 里有原文（界面「概览」页直接显示）。
+## 2. 83 个 verb 分组（46 写 / 37 只读）
 
-## 目录
+| 前缀 | 数量 | 写操作 | 用途 |
+|---|---|---|---|
+| `capability.*` | 1 | 0 | 当前权限画像（`isAdmin` / `integrityLevel` / `canLoadDriver`） |
+| `engine.*` | 1 | 0 | `engine.verbs` 自描述全部能力 |
+| `account.*` | 4 | 3 | 账户状态 / 管理员组 / UAC / 自动登录 |
+| `registry.*` | 3 | 2 | 注册表 get / set / delete（写入先备份） |
+| `process.*` | 10 | 5 | 清单 / 详情 / 终止 / 看门狗（会话内）/ IFEO 加载阻断 |
+| `wdac.*` | 9 | 5 | 状态 / 规则增删 / 策略构建校验 / 部署回滚 / 验证 |
+| `driver`（本体） | 15 | 8 | 加载/启动/停止/卸载、设备与对象图、内核基址、清理 |
+| `driver.profile.*` | 6 | 2 | profile 的 list/show/validate/save + **draft（静态起草）+ fromprobe（探测生成）** |
+| `driver.ctl.*` | 4 | 3 | IOCTL 发送 / 校验 / **variants（变异生成）/ probe（逐条实测）** |
+| `driver.vm.*` | 11 | 10 | **VM 沙箱层**（见第 2.5 节） |
+| `driver.batch.*` | 1 | 0 | 批量静态分诊（目录 → 风险排序） |
+| `samples.*` | 2 | 1 | 样本库（下载 + 强制 SHA256 校验） |
+| `plugins.*` | 3 | 1 | **第一段核心**：插件清单 / 详情 / 执行 |
+| `presets.*` | 3 | 1 | 预设包（数据驱动，加 JSON 即可扩展） |
+| `backup.*` | 3 | 1 | 备份列表 / 详情 / 回滚 |
+| `ai.*` | 7 | 4 | `manifest` / `plan` / `do` / `run` / `translate` / `auto` / `cred` |
 
-| 路径 | 作用 |
+---
+
+## 2.5 VM 沙箱层（driver.vm.*，11 个 verb）
+
+**为什么存在**：内核驱动的畸形 IOCTL 会让整机蓝屏。把这套操作放进虚拟机里跑，
+**崩了回滚快照 30 秒就回来**，于是"试错"这件事的代价趋近于零。
+
+**这一层不需要人懂内核**——这是它最重要的性质：
+
+```
+给一个 .sys  →  driver.vm.explore  →  14 分钟后拿到「它能做什么」的报告
+```
+
+| verb | 作用 |
 |---|---|
-| `core\Engine.ps1` / `Engine.psm1` | 引擎 CLI + verb 分发表（唯一入口） |
-| `core\Logging.psm1` | 路径 / 日志 / Result / 回收站 / 注册表键删除 / reg.exe 路径转换 |
-| `core\Backup.psm1` | 备份创建、列举、还原 |
-| `core\Registry.psm1` | 通用注册表读写 |
-| `core\Accounts.psm1` | 账户 / UAC / 自动登录 |
-| `core\Plugins.psm1` | 插件发现、校验、预览、执行 |
-| `ui\ConfigUI.ps1` | 旧 WinForms 界面（仍可运行，不再更新；当前主界面见 `ui-java\`） |
-| `presets\`、`plugins\` | 预设包、提权工具插件 |
-| `docs\CONTRACT.md` | 接口契约（冻结）：Result 形状、verb 清单、模块签名、安全铁律 |
-| `docs\ARCHITECTURE.md` | 架构与模块依赖约定 |
-| `var\logs`、`var\backups` | 日志与备份（可用环境变量 `LCT_VAR_DIR` 重定向，测试隔离用） |
+| `driver.vm.config` / `status` | 配置 VMware 路径/VMX/guest 凭据（密码走 DPAPI，不落明文）；查看就绪状态 |
+| `driver.vm.prepare` | 一次性环境准备（guest 建目录 + Defender 排除） |
+| `driver.vm.push` | 把驱动推到 guest |
+| `driver.vm.probe` | 单条 IOCTL 实测 |
+| `driver.vm.matrix` | 变异矩阵逐条实测（每条独立超时，崩溃即停） |
+| `driver.vm.fields` | **差分探测**：逐块改 payload，推出 in 字段布局（哪些偏移有效、多宽） |
+| `driver.vm.discover` | **暴力扫 IOCTL 码**：没有 profile 时靠遍历码范围找入口（多 payload 对比破解 `87` 的不可区分性） |
+| `driver.vm.batch` | 批量跑矩阵；**崩溃后自动回滚快照 → 启动 VM → 重建环境 → 继续** |
+| `driver.vm.snapshot` | 快照列表 / 创建 / 回滚 |
+| `driver.vm.explore` | **全自动探索**：push → 扫码 → 探布局 → 跑变异 → 出能力报告 |
 
-## 验收门（五项，全绿才算交付）
+### 自动化的演进链（每一层都消除了上一层的前置条件）
 
-```bat
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\SelfTest.ps1            rem 引擎端到端（退出码=失败项数）
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\Lint-PowerShell.ps1     rem 静态陷阱检查
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\UiPageSmoke.ps1         rem UI 页面填充驱动
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\Fix-Encoding.ps1        rem 编码归一化（幂等）
-powershell -NoProfile -ExecutionPolicy Bypass -File ui\ConfigUI.ps1 -SelfCheck    rem 前端构建 + 引擎可达
+```
+1. 人工写 profile            → 需要懂内核结构
+2. profile.draft             → 自动给出设备名 / IOCTL 候选 / 导入表（仍不可执行）
+3. vm.fields                 → 自动推出 in 字段布局（差分探测，2 分钟）
+4. vm.discover               → 自动找到 IOCTL 码（不需要任何前提）
+5. profile.fromprobe         → 合成可用 profile（自动填 method/out/presets）
+6. vm.explore                → 上面全部串起来，一条命令出报告
 ```
 
-五条退出码全为 0 才算绿。
+**实测（rtcore64，14.4 分钟，全程无人工）**：
 
-⚠ **`-SelfCheck` 只构建控件、不执行页面填充逻辑**，所以它绿 **不等于** 界面能点。
-界面相关的回归请看 `tests\UiPageSmoke.ps1`：它会真正调用 6 个页面的 `Update-Lct*` 填充函数
-（本轮真实事故就是这样漏掉的——`$pid` 只读变量赋值藏在预设页填充里）。
-
-## 踩坑速查（都是真实发生过的）
-
-- **界面弹 `Cannot overwrite variable PID …（该变量为只读变量或常量）`**
-  —— 把局部变量命名成了 PowerShell **只读自动变量**。实测 PS 5.1 只读名单：
-  `$pid`、`$host`、`$home`、`$true`、`$false`、`$ExecutionContext`、`$PSVersionTable`、
-  `$PSCulture`、`$PSUICulture`、`$PSHome`、`$ShellId`、`$ConsoleFileName`。改个名字即可；
-  `tests\Lint-PowerShell.ps1` 会提前抓出来。
-- **简单函数里用 `$Args` 当参数名** —— 会被自动变量 `$args` **静默顶掉**（`-Args <对象>` 绑成空
-  `Object[]`，不报错），需要参数包时写 `[Alias('Args')][object]$ArgBag`；高级函数（带
-  `[Parameter(...)]`）不受影响。lint 也查这一条。
-- **中文变乱码 / `The string is missing the terminator`** —— 文件丢了 UTF-8 BOM，PS 5.1 按 GBK 解析。
-  跑 `tests\Fix-Encoding.ps1`。
-- **参数报 `Invalid JSON primitive`** —— 用了内联 JSON；改用 `-ArgsFile`。
-- **`engine.verbs` 的 `availability` 有 false** —— 对应模块装载失败，`loadErrors` 里有原文。
-## 自定义驱动加载（2026-10-26 新增）
-
-**口径**：指定一个 `.sys`，把它加载起来。**不对驱动做签名或状态的前置校验** —— 签名与否交给操作系统判定：
-- test-signing 未开 ⇒ 未签名驱动会被系统拒绝，`sc start` 返回 `577 Windows cannot verify the digital signature`；
-- test-signing 已开 ⇒ 正常加载。
-
-工具**把系统的返回原文照抄给你**（`data.verdict{exitCode,message}`）。注意：`applied=true` 只代表**动作已执行**，
-**是否真的加载成功以系统返回为准**（工具不替系统下结论）。
-
-### 命令行
-```bat
-engine.cmd driver.status                          rem 前提现状：Secure Boot / test-signing / DSE / 驱动数与运行数
-engine.cmd driver.info  -ArgsFile args.json       rem {"path":"D:\\my.sys"}         只读：hash + 签名摘要（仅信息）
-engine.cmd driver.load  -ArgsFile args.json       rem {"path":"D:\\my.sys","name":"mydrv","startType":"demand"}
-engine.cmd driver.load  -ArgsFile args.json -Apply
-engine.cmd driver.verify -ArgsFile args.json      rem {"name":"mydrv"}   三档结论 + 系统事件原文
-engine.cmd driver.stop   -ArgsFile args.json -Apply
-engine.cmd driver.unload -ArgsFile args.json -Apply
 ```
-界面同理：第 9 页「驱动加载」，主区就是「指定驱动并加载」，结果区显示系统的 `exitCode` 与 `message` 原文。
+discover 64 个码 → accepted=2 / otherError=2 / invalidParam=58 / timeout=2
+fromprobe        → 自动选中真码 0x80002048，探出 2 个字段
+能力报告         → 「发现 2 个功能可用的 IOCTL 码」「存在会让驱动挂起/崩溃的码」
+```
 
-### 保留的唯一约束（都与签名无关，只为「不出事 / 能回滚」）
-1. 启动类型默认 `demand`（手动）；`system` / `boot`（开机即载）**必须显式 override** —— 那才是能把机器搞到
-   开不了机的高危路径。
-2. 同名服务已存在 ⇒ 默认拒绝覆盖（`override` 才允许，且先备份该服务的注册表键与画像）。
-3. 卸载**只删服务项、不删 `.sys` 文件**，并生成 `revert.cmd`（含原始 binPath/start 类型与重建命令）。
-4. 所有动作默认预览、写审计日志；删除一律走回收站。
-5. `driver.testsigning` 可开可关（写前记录原值、结果提示**需重启生效**）；**Secure Boot 开启时拒绝开启
-   test-signing**（协议不允许，如实说明原因）。
+### 两条硬教训（写进代码注释，也写在这里）
 
-### 本机实测前提（2026-10-26）
-`Secure Boot=False` · `testsigning=Yes`（已开启、立即生效）· `nointegritychecks=No` · VBS=0 · HVCI 未运行 ·
-`System32\drivers` 可写 ⇒ **本机此刻即可加载 test-signed / 未签名驱动**，无需重启。
+**① 探测产物的 `presets` 不能为空**
+
+`presets` 空 → 所有字段默认 0 → `readSize=0` → **驱动什么都不读，直接返回成功**。
+于是矩阵里一堆 `ok-data` 看起来"无害"，其实根本没干活。**结论全是假的。**
+
+现在 `fromprobe` 会扫 `1/4/8/16`，找"能让返回数据非全 0"的值当 preset。
+
+**② 扰动幅度决定生死**
+
+差分探测默认用 **`+1` 温和扰动**。用 `0xFF` 改 `offset` 字段会让驱动按 4GB 偏移访问 → **直接 BSOD**。
+`-Aggressive` 才用极值（能探出"无边界检查"，但会崩）。
+
+---
+
+## 3. 安全模型（五条铁律，代码里真的在拦）
+
+1. **写操作默认只预览** —— 46/83 个 verb 是 mutating，不 `-Apply` 就什么都不发生
+2. **AI 场景必须人在回路** —— 一次性确认短语 `I-UNDERSTAND-<8hex>`：10 分钟有效、绑定 verb+args、用后即焚
+3. **写入先备份、可回滚** —— 每次改系统前自动备份，`backupId` 进结果；驱动卸载只删服务项不删 `.sys`
+4. **失败如实上报** —— 系统返回码（577 / 193 / 1053 …）原样照抄，拿不准就写"状态不明"，不美化
+5. **用完清理** —— `driver.cleanup` 只卸本工具加载过的服务，后台确认系统状态复原
+
+**危险动作的额外闸门**：
+
+| 动作 | 闸门 |
+|---|---|
+| bsod 级 IOCTL | 默认禁用，需 `-OverrideBsod`（连预览都拒） |
+| 驱动写（kwrite） | 无原值不写 |
+| 弱驱动识别 | profile 的 `target.sha256` 指纹不符即拒 |
+| 静态草案（draft） | `actions` 为空 + `needsReview=true` ⇒ 结构上不可执行 |
+| **VM 内的操作** | **不需要审定** —— 崩了回滚快照即可。只有「把 VM 结论应用到实体机」才需要人复核 |
+| WDAC 强制部署 | 审计优先；命中系统目录 / 无 allow 机制 / 缺救命绳一律拒 |
+
+---
+
+## 4. 扩展方式
+
+### 插件（第一段：提权/任意工具）
+
+```
+plugins\my-tool\
+    plugin.json     ← 清单：id / name / risk / entry / params
+    run.ps1         ← 入口：收到参数，非提权上下文运行，退出码约定
+```
+
+`plugins.run` 默认只预览（解析出命令行但不执行），`-Apply` 才真跑。清单格式直接看 `plugins\example-v2-sysinfo\plugin.json`（可运行的实例）。
+
+### 驱动 profile（第二段：内核操作）
+
+**纯数据**，不会写代码也能接一个新驱动：
+
+```json
+{
+  "id": "vendor-driver-<hash8>",
+  "target": { "sha256": "<64 hex 指纹>", "fileName": "xxx.sys" },
+  "locate": { "strategy": "symlink", "candidates": ["\\??\\DeviceName"] },
+  "actions": {
+    "kread": {
+      "ioctl": "0x80002048",
+      "in": [
+        { "name": "pad0",     "type": "bytes", "len": 8 },
+        { "name": "addr",     "type": "u64" },
+        { "name": "pad1",     "type": "bytes", "len": 4 },
+        { "name": "offset",   "type": "u32" },
+        { "name": "readSize", "type": "u32" },
+        { "name": "value",    "type": "u32" },
+        { "name": "pad3",     "type": "bytes", "len": 16 }
+      ],
+      "presets": { "readSize": 4 }
+    }
+  },
+  "layout": { "method": "buffered", "align": 8 },
+  "risk": { "level": "bsod", "notes": "任意内核读写" }
+}
+```
+
+指纹不符即拒。字段布局细节见 `core\DriverProfiles.psm1` 头部注释；自研驱动照 ABI 实现则**无需 profile**。
+
+**不想手写？让机器探**：
+
+```bat
+engine.cmd -Verb driver.vm.explore -ArgsFile a.json -Apply
+  :: a.json = {"sysPath":"...\\xxx.sys"}
+  :: 14 分钟后输出：能用哪些 IOCTL 码 / 字段布局 / 哪些输入会崩
+  :: 产物同时落盘成可用 profile（可直接 driver.vm.matrix 跑）
+```
+
+`layout.method` 也能从码本身算出来：`ioctl & 3`（0=buffered 1=in-direct 2=out-direct 3=neither），
+`& 3 == 3` 意味着驱动直接操作用户态指针 —— **未验证前不要碰**。
+
+### 预设包
+
+`presets\*.json` —— 数据驱动的批量配置（如禁用型注册表项），加 JSON 即可扩展。
+
+---
+
+## 5. 目录
+
+```
+core\          引擎（19 个模块：Registry/Accounts/Processes/Wdac/Drivers/DriverProfiles/
+               Samples/Plugins/PluginSdk/Ai/Capabilities/Backup/Logging/WatchHost/Engine…）
+plugins\       插件（第一段：提权 / 任意工具）
+presets\       预设包（数据驱动）
+samples\       样本库规则（只放 URL/哈希/风险，不放可执行载荷）
+ui-java\       Java Swing 界面（当前维护中）
+ui\            旧 WinForms 界面（保留可运行，不再更新）
+tools\         McpServer.ps1（AI 宿主挂载）+ 构建脚本
+  vm-agent\    guest 侧探测脚本（guest-probe.ps1 等）—— 推送到 VM 里执行
+docs\          参考资料（**不随本包分发**；需要时在完整源码里看）
+var\           运行数据：日志/备份/已下载样本/DPAPI 凭据 —— 不入库、勿分发
+engine.cmd     引擎入口
+run-ui.cmd     界面入口
+```
+
+---
+
+## 6. 关于本文档
+
+**本文档是唯一文档。** 它的组织方式是「结论先行」：
+
+- 第 0 节（两段式权限跃迁）是**最容易被误读的地方**，务必先读
+- 第 2~4 节是能力清单与安全模型
+- 第 5 节是目录结构
+- 附录（文末）是**改代码时的硬约束**（Result 形状、安全铁律、编码约定、模块边界、未验证项）
+
+更细的实现细节在各模块的头部注释里（每个 `core\*.psm1` 开头都有"职责/导出/铁律"三段说明）。
+
+## 7. 验收（有测试时）
+
+```bat
+tests\Run-AllGates.ps1
+```
+
+27 道门禁（纯净代码包不含 `tests\`，完整源码包有）：编码 / Lint / 自测 / 界面 / 进程 / WDAC /
+驱动 / profile / 对象图 / Java UI / 能力 / AI 三层 / 云 API / 样本库 / 插件 SDK / 简化输出 /
+驱动批量分诊 / 准确率校准 / 变异生成 / **VM 沙箱（56 断言，含崩溃恢复）**。
+
+---
+
+## 免责声明
+
+- 仅在**你完全拥有处置权**的机器上使用（虚拟机 / 快照最佳）
+- 驱动加载与内核操作有蓝屏风险，工具默认**只预览**
+- 使用者自行承担全部责任；请勿用于未授权的系统

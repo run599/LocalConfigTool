@@ -11,6 +11,50 @@
 
 通用的是**格式 + 执行引擎**，不是驱动本身。任何声称"任意驱动拿来就能执行任意命令"的说法都在骗人。
 
+## profile 的三条来路（2026-11 更新，按代价从高到低）
+
+| 来路 | 命令 | 代价 | 用在哪 |
+|---|---|---|---|
+| **① 手写** | 编辑 JSON | 需要读懂驱动的 IOCTL 结构 | 需要长期维护、要精确语义的场合 |
+| **② draft + 审定** | `driver.profile.draft` → 人工补 `actions` | 中等 | **实体机**使用前的标准路径 |
+| **③ 探测生成** | `driver.profile.fromprobe`（或 `driver.vm.explore` 全自动） | 约 2 分钟 / 14 分钟 | **虚拟机里**实测 |
+
+**关键区分 —— 要不要人工审定，取决于「在哪里用」**：
+
+```
+在 VM 里测         →  不需要审定。崩了回滚快照 30 秒（见 CONTRACT.md §14.3）
+应用到实体机        →  必须审定。这里的错误代价是用户机器蓝屏
+```
+
+所以 `fromprobe` 的产物带的是：
+
+```json
+"source": { "generatedBy": "driver.profile.fromprobe",
+            "probeGenerated": true,
+            "verifiedInVm": true }     // 注意：没有 needsReview
+```
+
+**它能直接喂给 `driver.vm.matrix`**。但要拿到真实系统上跑，请自己负责复核。
+
+### 探测产物能自动填什么
+
+| 字段 | 来源 |
+|---|---|
+| `target.sha256` / `fileName` | 算 |
+| `locate.candidates` | 静态扫（UTF-16 字符串 + xref） |
+| `actions[].ioctl` | `vm.discover` 暴力扫 / `dispatch` 跳转表识别 / 显式指定 |
+| `actions[].in` | `vm.fields` 差分探测（逐块改 payload，看哪块影响行为） |
+| `actions[].out` | **不写** —— 实测多数 buffered 驱动的 out 与 in 同构，执行器按 in 推导 |
+| `presets` | 探测时扫 `1/4/8/16`，取"能让返回数据非全 0"的值 |
+| `layout.method` | **`ioctl & 3`**（0=buffered 1=in-direct 2=out-direct 3=neither） |
+| `risk.level` | `method==3` 或探测中出现崩溃 ⇒ `bsod` |
+
+**⚠ 最容易踩的坑**：探测产物的 `presets` 如果是空的，所有字段默认 0 → `readSize=0` →
+**驱动什么都不读直接返回成功**，于是矩阵里一堆 `ok-data` 看起来"无害"，其实根本没干活。
+`fromprobe` 现在会扫 preset，扫不到会**明确警告结论不可信**（详见 `docs\PITFALLS.md` A1）。
+
+---
+
 ## 本版不预置任何真实驱动的 profile
 
 **这是刻意的**：一个未经人工确认 IOCTL 语义与输入结构的 profile，`-Apply` 一下就可能立刻蓝屏。
@@ -18,6 +62,7 @@
 
 ```
 driver.profile.draft  -Path <某.sys>          # 静态、只读：PE 解析 → 设备名候选 → IOCTL 候选 → confidence
+driver.profile.fromprobe -SysPath <某.sys> -Ioctl <码>   # 差分探测 → 自动合成可用 profile（约 2 分钟）
 driver.profile.save   -Id <id> -Json <草案>   # 默认只预览；-Apply 写 user 来源：var\driver-profiles\<id>.json
 driver.profile.validate -Id <id> -Path <.sys> # schema + target.sha256 指纹门 + 内存沙盒（不碰内核）
 driver.devices        -Name <service>         # 注册表解 .sys 路径 + 候选入口 CreateFile 可用性（不发 IOCTL）

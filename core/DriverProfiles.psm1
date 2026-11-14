@@ -1399,7 +1399,7 @@ function Get-LctPrfPeImage {
         machine = 0; machineName = ''; peKind = ''; numberOfSections = 0; timestamp = 0; subsystem = 0
         imageBase = [uint64]0; entryPoint = 0; sections = @(); imports = @(); importedNames = @(); importsOfInterest = @()
         asciiStringCount = 0; wideStringCount = 0; deviceNameCandidates = @(); candidatesFound = 0
-        ioctlCandidates = @(); ioctlCandidateCount = 0; ioctlScanTruncated = $false; inputSizeHints = @()
+        ioctlCandidates = @(); ioctlCandidateCount = 0; ioctlCandidatesMethod = 'heuristic-cmp'; ioctlCandidatesReliability = 'n/a'; ioctlScanTruncated = $false; inputSizeHints = @()
         scanMethods = @(); notes = (New-Object System.Collections.ArrayList)
     }
     if ([string]::IsNullOrWhiteSpace($Path)) { $o.error = '缺少路径'; return [pscustomobject]$o }
@@ -1618,14 +1618,19 @@ function Get-LctPrfPeImage {
         $immOff = $m.Index + $m.Length - 4
         if (($immOff + 4) -gt $img.Length) { continue }
         $imm = [uint32][BitConverter]::ToUInt32($img, $immOff)
-        $imm64 = [int64]$imm
-        $high = $imm64 -band 0xF0000000
-        $dtype = ($imm64 -shr 16) -band 0xFFFF
-        $func = ($imm64 -shr 2) -band 0xFFF
-        $meth = $imm64 -band 3
+        # 注意：$imm 是 uint32（正数）。旧写法 `$high = $imm64 -band 0xF0000000` 与字面量
+        # `0x80000000`（PowerShell 里是 Int32 = -2147483648）比较时符号不一致 → 永不相等，
+        # 导致所有候选都掉到 possible（实测 acpi 64 个、rtcore64 6 个全是 possible，分层形同虚设）。
+        # 改用高 4 位（0..15）判断，彻底绕开符号问题。
+        $dtype = ($imm -shr 16) -band 0xFFFF
+        $func = ($imm -shr 2) -band 0xFFF
+        $meth = $imm -band 3
+        $highNibble = ($imm -shr 28) -band 0xF
+        $dtypeOk = (($dtype -ge 0x8000 -and $dtype -le 0xFFFF) -or ($dtype -ge 1 -and $dtype -le 0x27))
         $tier = ''
-        if (@(0x80000000, 0x90000000, 0xA0000000, 0xC0000000) -contains $high) { $tier = 'likely' }
-        elseif ((($dtype -ge 0x8000 -and $dtype -le 0xFFFF) -or ($dtype -ge 1 -and $dtype -le 0x27)) -and $func -ne 0 -and $meth -ne 3) { $tier = 'possible' }
+        # likely：比 IOCTL 码的标准形态（高 4 位 8/9/A/C + DeviceType 合理 + Function 非 0）
+        if (($highNibble -eq 8 -or $highNibble -eq 9 -or $highNibble -eq 0xA -or $highNibble -eq 0xC) -and $dtypeOk -and $func -ne 0) { $tier = 'likely' }
+        elseif ($dtypeOk -and $func -ne 0 -and $meth -ne 3) { $tier = 'possible' }
         if ($tier -eq '') { continue }
         $key = [string]$imm
         if ($byVal.ContainsKey($key)) {
@@ -1638,7 +1643,7 @@ function Get-LctPrfPeImage {
                 value = $imm; hex = ('0x' + ('{0:X8}' -f $imm)); tier = $tier; count = 1; method = $meth
                 methodName = @('buffered', 'in-direct', 'out-direct', 'neither')[([int]$meth)]
                 methodRisky = ($meth -eq 3); deviceType = ('0x' + ('{0:X4}' -f $dtype)); function = ('0x' + ('{0:X3}' -f $func))
-                fileOffsets = @($immOff); xrefHint = 'heuristic'
+                fileOffsets = @($immOff); xrefHint = 'heuristic-cmp'
             }
         }
     }
@@ -1646,8 +1651,13 @@ function Get-LctPrfPeImage {
     foreach ($k in @($byVal.Keys | Sort-Object)) { $null = $cands.Add($byVal[$k]) }
     $o.ioctlCandidates = @($cands)
     $o.ioctlCandidateCount = @($cands).Count
-    if (@($cands).Count -eq 0) { $null = $o.notes.Add('ioctlCandidates=0：没有扫到像 IOCTL 的 CMP 立即数（可能是跳转表分派或先做位运算）。不编造。') }
-    else { $null = $o.notes.Add('IOCTL 候选来自 CMP reg,imm32 的启发式筛选（DeviceType/Method 位分层），**必须人工确认后才可写入 actions**。') }
+    $o.ioctlCandidatesMethod = 'heuristic-cmp'
+    if (@($cands).Count -gt 0) { $o.ioctlCandidatesReliability = 'low' } else { $o.ioctlCandidatesReliability = 'n/a' }
+    if (@($cands).Count -eq 0) { $null = $o.notes.Add('ioctlCandidates=0：没有扫到像 IOCTL 的 CMP 立即数。不编造。') }
+    else {
+        $null = $o.notes.Add('IOCTL 候选来自 CMP reg,imm32 的启发式筛选（DeviceType/Method 位分层）。**必须人工确认后才可写入 actions**。')
+        $null = $o.notes.Add('[局限] 本方法只在「逐条 CMP 分派」的驱动上有效。对「switch 编译成跳转表」的驱动（lea + movsxd + jmp reg）**完全失效**——而跳转表是编译器对 switch 的默认生成方式。实测 rtcore64 用跳转表分派：文件里根本没有 0x80002048 常量，扫出的候选全是噪音。看到本字段不为空时，请假定它可能是噪音，用动态验证确认。')
+    }
     # ---- 输入大小提示：IOCTL 判断点附近的小立即数比较 ----
     $hints = New-Object System.Collections.ArrayList
     foreach ($c in @($cands)) {
@@ -2374,6 +2384,11 @@ function New-LctDriverProfileDraft {
     $devWithXref = @($pe.deviceNameCandidates | Where-Object { [int]$_.xrefs -gt 0 }).Count
     $hintCount = 0
     foreach ($h in @($pe.inputSizeHints)) { $hintCount += @($h.inputSizeHints).Count }
+    # 跳转表分派识别（解决「正则找 CMP 在 switch 驱动上失效」）。可能耗时 ~300ms；
+    # 没 rizin 时走降级路径（只报结构，不猜基址）。
+    $dispatchInfo = $null
+    try { $dispatchInfo = Get-LctPrfJumpTable -Path $Path } catch { $dispatchInfo = $null }
+
     $conf = 0.10
     $why = New-Object System.Collections.ArrayList
     $null = $why.Add('0.10 基础分：文件存在且已算 SHA256')
@@ -2383,8 +2398,9 @@ function New-LctDriverProfileDraft {
     if (@($pe.importsOfInterest).Count -gt 0) { $conf += 0.05; $null = $why.Add('+0.05 导入了驱动常用内核 API（' + @($pe.importsOfInterest).Count + ' 个）') }
     if (@($pe.deviceNameCandidates).Count -gt 0) { $conf += 0.08; $null = $why.Add('+0.08 找到设备名字符串（' + @($pe.deviceNameCandidates).Count + ' 条）') }
     if ($devWithXref -gt 0) { $conf += 0.15; $null = $why.Add('+0.15 其中 ' + $devWithXref + ' 条设备名有 xref 证据（rip-relative 或指针值）') }
-    if ($tierA -gt 0) { $conf += 0.20; $null = $why.Add('+0.20 有 ' + $tierA + ' 个高可信 IOCTL 候选（DeviceType/Method 位分层）') }
-    if ($tierA -ge 3) { $conf += 0.05; $null = $why.Add('+0.05 IOCTL 高可信候选 >= 3') }
+    # IOCTL 候选只给 +0.05：它证明"扫到了东西"，但对跳转表分派的驱动是噪音
+    # （实测 rtcore64 的候选 100% 是噪音）。不因为它涨"分析完整度"。
+    if ($tierA -gt 0) { $conf += 0.05; $null = $why.Add('+0.05 扫到 ' + $tierA + ' 个 IOCTL 候选（可靠性低：对跳转表分派无效，见 notes）') }
     if ($hintCount -gt 0) { $conf += 0.05; $null = $why.Add('+0.05 有 ' + $hintCount + ' 个输入大小提示') }
     $conf = [Math]::Round($conf, 2)
     if ($conf -gt 0.95) { $conf = 0.95 }
@@ -2415,7 +2431,7 @@ function New-LctDriverProfileDraft {
             needsReview = $true
             confidence = $conf
             confidenceReason = @($why)
-            evidence = [ordered]@{
+        evidence = [ordered]@{
                 machine = $pe.machineName; peKind = $pe.peKind; numberOfSections = $pe.numberOfSections
                 entryPoint = ('0x' + ('{0:X}' -f [uint32]$pe.entryPoint)); imageBase = ('0x' + ('{0:X}' -f [uint64]$pe.imageBase))
                 subsystem = $pe.subsystem; timestamp = ('0x' + ('{0:X}' -f [uint32]$pe.timestamp))
@@ -2426,6 +2442,9 @@ function New-LctDriverProfileDraft {
                 ioctlCandidates = @($ioctlCand)
                 ioctlScanTruncated = [bool]$pe.ioctlScanTruncated
                 inputSizeHints = @($pe.inputSizeHints)
+                # 跳转表分派识别：解决"正则找 CMP 在 switch 驱动上失效"的问题。
+                # 有 rizin 时能精确给出 IOCTL 码范围；没有时只报"发现结构"（不猜基址）。
+                dispatch = $dispatchInfo
                 scanMethods = @($pe.scanMethods)
                 limits = @(
                     'IOCTL 候选是 CMP reg,imm32 的启发式筛选，不是反汇编器；跳转表分派、位运算判定的驱动会扫不到。'
@@ -3519,6 +3538,170 @@ function Get-LctKernelBaseAddress {
     return [pscustomobject]$out
 }
 
+# =====================================================================
+# 跳转表分派识别（Get-LctDriverDispatch）
+#
+# 背景：MSVC 把 switch(IoControlCode) 编译成跳转表时，文件里**没有** IOCTL 常量，
+#       所以正则找 CMP imm32 完全失效（实测 rtcore64：0x80002048 在文件里 0 处）。
+#       本函数用「字节扫描找锚点 + rizin 反汇编小窗口读参数」把它修回来。
+#
+# 为什么不用 rizin 全量反汇编：实测 20KB .text 要 16 秒、100KB 要 90+ 秒（超时）。
+# 而只反汇编锚点前后 104 字节 → 336ms，快 50-300 倍。
+#
+# 为什么不能纯字节扫描算基址：`3B 05 00 00 8B 40` 里的 05 是 ModRM 字节，
+#       会被误当成 `add eax, imm32`（实测把基址算成 0xBF750000）。必须有指令边界。
+#
+# 返回：
+#   @{ ok; hit; base; count; ioctlRange; movsxdVa; cmpImm; addText; reason; ms; method }
+# =====================================================================
+
+function Get-LctPrfRizinPath {
+    foreach ($c in @('rizin', 'D:\Rizin\bin\rizin.exe', 'C:\Program Files\rizin\bin\rizin.exe', 'C:\Program Files\rizin\rizin.exe')) {
+        try {
+            $p = Get-Command $c -ErrorAction Stop
+            if ($null -ne $p) { return $p.Source }
+        } catch {
+            if (Test-Path -LiteralPath $c) { return $c }
+        }
+    }
+    return ''
+}
+
+function Invoke-LctPrfRizin {
+    param([string]$RzPath, [string[]]$CmdArgs, [int]$TimeoutSec = 30)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $RzPath
+    $argList = @()
+    foreach ($a in $CmdArgs) {
+        $s = [string]$a
+        if ($s -match '[\s"]') { $argList += ('"' + ($s -replace '"', '\"') + '"') } else { $argList += $s }
+    }
+    $psi.Arguments = ($argList -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $out = ''
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $ot = $p.StandardOutput.ReadToEndAsync()
+        $et = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit([Math]::Max(1000, $TimeoutSec * 1000))) { try { $p.Kill() } catch { } }
+        try { $out = [string]$ot.Result } catch { }
+    } catch { }
+    return ($out -replace '\x1b\[[0-9;]*[A-Za-z]', '')
+}
+
+function Get-LctPrfJumpTable {
+    <#
+    .SYNOPSIS 识别驱动的 IOCTL 跳转表分派，提取基址与表大小
+    .DESCRIPTION
+      字节扫描找锚点（movsxd rax, dword [reg+reg*4] 的编码），
+      再用 rizin 只反汇编锚点前 104 字节（有指令边界），精确读 add/sub + cmp。
+      没有 rizin 时降级：只报"发现跳转表结构"，不给基址（避免误报）。
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $res = [ordered]@{
+        ok = $false; hit = $false; base = ''; count = 0; ioctlRange = ''
+        movsxdVa = ''; cmpImm = -1; addText = ''; reason = ''; ms = 0
+        method = 'bytes-anchor+rizin-window'; degraded = $false
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    if (-not (Test-Path -LiteralPath $Path)) { $res.reason = '文件不存在'; return [pscustomobject]$res }
+    $bytes = $null
+    try { $bytes = [IO.File]::ReadAllBytes($Path) } catch { $res.reason = '读取失败'; return [pscustomobject]$res }
+
+    # 1) 字节扫描找锚点：movsxd reg, dword [base+reg*4]
+    $movs = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -le ($bytes.Length - 4); $i++) {
+        if ($bytes[$i] -ne 0x63) { continue }
+        $modrm = $bytes[$i + 1]
+        if ($modrm -notin @(0x04, 0x0C, 0x14, 0x1C, 0x24, 0x2C, 0x34, 0x3C)) { continue }
+        $sib = $bytes[$i + 2]
+        $scale = ($sib -shr 6) -band 3
+        $index = ($sib -shr 3) -band 7
+        if ($scale -eq 2 -and $index -ne 4) { $null = $movs.Add($i) }
+    }
+    if (@($movs).Count -eq 0) {
+        $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds; $res.ok = $true
+        $res.reason = '没有跳转表锚点（不是 jmp-table 分派，可能是 cmp 链或没有 IOCTL 分派）'
+        return [pscustomobject]$res
+    }
+
+    $rz = Get-LctPrfRizinPath
+    if ($rz -eq '') {
+        $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds; $res.ok = $true
+        $res.degraded = $true; $res.hit = $true
+        $res.reason = '无 rizin：只能确认存在跳转表结构，无法精确读基址/范围'
+        return [pscustomobject]$res
+    }
+
+    # 2) 段表（文件偏移 → VA）
+    $secOut = Invoke-LctPrfRizin -RzPath $rz -CmdArgs @('-q', '-c', 'iS', $Path) -TimeoutSec 20
+    $secMap = New-Object System.Collections.ArrayList
+    foreach ($ln in @($secOut -split "`r?`n")) {
+        if ($ln -match '^\s*0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)') {
+            $null = $secMap.Add([pscustomobject]@{
+                    paddr = [Convert]::ToInt64($matches[1], 16)
+                    size  = [Convert]::ToInt64($matches[2], 16)
+                    vaddr = [Convert]::ToInt64($matches[3], 16)
+                })
+        }
+    }
+
+    # 3) 对每个锚点：看后面 24 字节内有没有 jmp reg，有则反汇编前 104 字节读参数
+    foreach ($mo in $movs) {
+        $hasJmp = $false
+        for ($k = $mo + 3; $k -le [Math]::Min($mo + 24, $bytes.Length - 2); $k++) {
+            if ($bytes[$k] -eq 0xFF -and $bytes[$k + 1] -ge 0xE0 -and $bytes[$k + 1] -le 0xE7) { $hasJmp = $true; break }
+        }
+        if (-not $hasJmp) { continue }
+
+        $va = [int64]0
+        foreach ($s in @($secMap)) {
+            if ($mo -ge $s.paddr -and $mo -lt ($s.paddr + $s.size)) { $va = $s.vaddr + ($mo - $s.paddr); break }
+        }
+        if ($va -le 0) { continue }
+
+        $asmOut = Invoke-LctPrfRizin -RzPath $rz -CmdArgs @('-q', '-A', '-c', ('pD 104 @ ' + ($va - 80)), $Path) -TimeoutSec 30
+        $baseVal = $null
+        $countVal = $null
+        foreach ($ln in @($asmOut -split "`r?`n")) {
+            if ($ln -notmatch '0x([0-9a-fA-F]{6,})') { continue }
+            $lineVa = [Convert]::ToInt64($matches[1], 16)
+            # 只解析锚点**之前** 40 字节：之后的 cmp 是别的检查（实测有 cmp edx,0x30 是长度检查）
+            if ($lineVa -lt ($va - 40) -or $lineVa -ge $va) { continue }
+            if ($ln -match '\b(add|sub)\s+(eax|ecx|edx)\s*,\s*(0x[0-9a-fA-F]+)') {
+                $op = $matches[1]
+                $imm = [Convert]::ToUInt64(($matches[3] -replace '^0x', ''), 16)
+                if ($op -eq 'sub') { $baseVal = $imm }
+                else { $baseVal = ([uint64]0x100000000 - $imm) -band 0xFFFFFFFF }
+                $res.addText = ($op + ' 0x' + ('{0:X}' -f $imm))
+            }
+            if ($null -eq $countVal -and $ln -match '\bcmp\s+(eax|ecx|edx)\s*,\s*(0x[0-9a-fA-F]+)') {
+                $countVal = [Convert]::ToInt32(($matches[2] -replace '^0x', ''), 16) + 1
+            }
+        }
+        if ($null -ne $countVal -and $countVal -ge 1 -and $countVal -le 4096) {
+            $res.ok = $true
+            $res.hit = $true
+            $res.count = $countVal
+            $res.cmpImm = $countVal - 1
+            $res.movsxdVa = ('0x{0:X}' -f $va)
+            if ($null -ne $baseVal -and $baseVal -gt 0) {
+                $res.base = ('0x{0:X}' -f $baseVal)
+                $res.ioctlRange = ('0x{0:X}..0x{1:X}' -f $baseVal, ($baseVal + $countVal - 1))
+            } else { $res.base = '?'; $res.reason = '识别到跳转表但基址未知（add/sub 未命中）' }
+            $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds
+            return [pscustomobject]$res
+        }
+    }
+
+    $sw.Stop(); $res.ms = $sw.ElapsedMilliseconds; $res.ok = $true
+    $res.reason = ('有 ' + @($movs).Count + ' 个锚点，但没配套 add+cmp 链条')
+    return [pscustomobject]$res
+}
+
 Export-ModuleMember -Function Get-LctDriverProfileList, Get-LctDriverProfileShow, Test-LctDriverProfile,
     New-LctDriverProfileDraft, Get-LctDriverDevices, Invoke-LctDriverCtl, Get-LctDriverCtlVerify,
-    Save-LctDriverProfile, Get-LctKernelBaseAddress
+    Save-LctDriverProfile, Get-LctKernelBaseAddress, ConvertTo-LctPrfBuffer, Get-LctPrfJumpTable, Get-LctPrfRizinPath

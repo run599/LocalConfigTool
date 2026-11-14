@@ -1,4 +1,4 @@
-{
+﻿{
   "schema": 2,
   "name": "LocalConfigTool 内置样本目录（预置规则 + 已验证 profile）",
   "note": "这里只放规则与**纯数据 profile**（名称/CVE/来源/哈希/风险/动作结构），不放可执行载荷。载荷由 samples.get 按需获取并强制 SHA256 校验；条目若自带 profile，会在下载成功后自动落盘到 var\\driver-profiles\\，于是拿到样本就能直接发 action，不用自己写结构体 JSON。用户也可以在 var\\samples\\catalog.local.json 里追加条目（同名 id 以本地为准）。",
@@ -24,16 +24,16 @@
         "常被用于 BYOVD 提权与关闭 DSE"
       ],
       "risk": "high",
-      "verified": false,
-      "url": "",
-      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "verified": true,
+      "url": "https://github.com/magicsword-io/LOLDrivers/raw/main/drivers/2d8e4f38b36c334d0a32a7324832501d.bin",
+      "sha256": "01aa278b07b58dc46c84bd0b1b5c8e9ee4e62ea0bf7a695862444af32e87f1fd",
       "notes": "本机已实测：driver.use 加载成功、kread(0x80002048) 在 ntoskrnl 基址读回 0x00905A4D（MZ）。设备 \\Device\\RTCore64。测完立刻 driver.cleanup（或 driver.release -Path）。",
       "profile": {
         "id": "rtcore64-01aa278b",
         "kind": "driver-profile",
         "engineApi": 2,
         "target": {
-          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "sha256": "01aa278b07b58dc46c84bd0b1b5c8e9ee4e62ea0bf7a695862444af32e87f1fd",
           "fileName": "RTCore64.sys"
         },
         "locate": {
